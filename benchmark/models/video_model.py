@@ -102,9 +102,9 @@ class Bench(nn.Module):
             nn.Conv2d(channel_M * 3, channel_M * 2, 3, padding=1)
         )
 
-        self.entropy_bottleneck = EntropyBottleneck(channel_mv)
-        self.entropy_bottleneck = EntropyBottleneck(channel_M)
-
+        self.bit_estimator_z = EntropyBottleneck(channel_mv)
+        self.bit_estimator_z_mv = EntropyBottleneck(channel_N)
+        
         # self.contextual_decoder = ContextualDecoder(channel_N=channel_N, channel_M=channel_M)
         # self.recon_generation_net = ReconGeneration()
 
@@ -139,11 +139,10 @@ class Bench(nn.Module):
         est_mv = self.optic_flow(x, ref_frame)
         mv_y = self.mv_encoder(est_mv)
         mv_z = self.mv_hyper_prior_encoder(mv_y)
-
+        mv_z_hat, mv_z_likelihoods = self.bit_estimator_z(mv_z)
+        mv_params = self.mv_hyper_prior_decoder(mv_z_hat)
 
         
-        mv_z_hat = self.quant(mv_z)
-        mv_params = self.mv_hyper_prior_decoder(mv_z_hat)
         ref_mv_y = dpb["ref_mv_y"]
         if ref_mv_y is None:
             ref_mv_y = torch.zeros_like(mv_y)

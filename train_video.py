@@ -136,7 +136,6 @@ def train_one_epoch(
                     "ref_mv_y": None,
                 }
 
-        print(d[1].shape)
         result = model(d[1], dpb)
 
         out_criterion = criterion(out_net, d)
