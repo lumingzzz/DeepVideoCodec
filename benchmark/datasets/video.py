@@ -114,8 +114,7 @@ class VideoFolder(Dataset):
         frames = np.concatenate(
             [np.asarray(Image.open(p).convert("RGB")) for p in frame_paths], axis=-1
         )
-        print(frames.shape)
-        frames = torch.chunk(self.transform(frames), 3)
+        frames = torch.chunk(self.transform(frames), self.max_frames)
 
         if self.rnd_temp_order:
             if random.random() < 0.5:

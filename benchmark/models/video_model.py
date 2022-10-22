@@ -136,7 +136,6 @@ class Bench(nn.Module):
 
     def forward(self, x, dpb):
         ref_frame = dpb["ref_frame"]
-        print(x.shape, ref_frame.shape)
         est_mv = self.optic_flow(x, ref_frame)
         mv_y = self.mv_encoder(est_mv)
         mv_z = self.mv_hyper_prior_encoder(mv_y)
