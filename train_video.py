@@ -1,226 +1,321 @@
-from tqdm import tqdm
-import logging
 import argparse
-import math
+import logging
+import os
+import random
+import time
+import sys
+import shutil
+from datetime import datetime
+from typing import List
+
 import torch
-import torchvision as tv
-from torch.nn.parallel import DistributedDataParallel as DDP
-from timm.utils import unwrap_model
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import transforms
 
-from lvae.trainer import BaseTrainingWrapper
-from lvae.datasets.video import Vimeo90k
-
-
-def parse_args():
-    # ====== set the run settings ======
-    parser = argparse.ArgumentParser()
-    # wandb setting
-    parser.add_argument('--wbproject',  type=str,  default='qres-video')
-    parser.add_argument('--wbgroup',    type=str,  default='default')
-    parser.add_argument('--wbtags',     type=str,  default=None, nargs='+')
-    parser.add_argument('--wbnote',     type=str,  default=None)
-    parser.add_argument('--wbmode',     type=str,  default='disabled')
-    parser.add_argument('--name',       type=str,  default=None)
-    # model setting
-    parser.add_argument('--model',      type=str,  default='cspy')
-    parser.add_argument('--model_args', type=str,  default='')
-    # resume setting
-    parser.add_argument('--resume',     type=str,  default=None)
-    parser.add_argument('--weights',    type=str,  default=None)
-    parser.add_argument('--load_optim', action=argparse.BooleanOptionalAction, default=False)
-    # data setting
-    # parser.add_argument('--trainset',   type=str,  default='-')
-    parser.add_argument('--tr_frames',  type=int,  default=3)
-    parser.add_argument('--valset',     type=str,  default='uvg-1080p')
-    parser.add_argument('--val_frames', type=int,  default=12)
-    # optimization setting
-    parser.add_argument('--batch_size', type=int,  default=4)
-    parser.add_argument('--accum_num',  type=int,  default=1)
-    parser.add_argument('--optimizer',  type=str,  default='adam')
-    parser.add_argument('--lr',         type=float,default=2e-4)
-    parser.add_argument('--lr_sched',   type=str,  default='constant')
-    parser.add_argument('--lr_warmup',  type=int,  default=1000)
-    parser.add_argument('--grad_clip',  type=float,default=2.0)
-    # training iterations setting
-    parser.add_argument('--iterations', type=int,  default=1_000_000)
-    parser.add_argument('--log_itv',    type=int,  default=100)
-    parser.add_argument('--study_itv',  type=int,  default=1000)
-    parser.add_argument('--eval_itv',   type=int,  default=2000)
-    parser.add_argument('--eval_first', action=argparse.BooleanOptionalAction, default=True)
-    # exponential moving averaging (EMA)
-    parser.add_argument('--ema',        action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--ema_decay',  type=float,default=0.9999)
-    parser.add_argument('--ema_warmup', type=int,  default=10_000)
-    # device setting
-    parser.add_argument('--fixseed',    action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--workers',    type=int,  default=0)
-    cfg = parser.parse_args()
-
-    cfg.wdecay = 0.0
-    cfg.amp = False
-    return cfg
+from benchmark.datasets import VideoFolder
+from benchmark.models import Bench
 
 
-def make_generator(dataset, batch_size, workers):
-    from torch.utils.data import DataLoader
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True,
-                            num_workers=workers, pin_memory=True)
-    while True:
-        yield from dataloader
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="Example training script.")
+    parser.add_argument("--seed", type=float)
+    parser.add_argument("--model", type=str, default="benchmark")
+    parser.add_argument("--quality-level", type=int, default=3)
+    parser.add_argument('--name', type=str, default=datetime.now().strftime('%Y-%m-%d_%H_%M_%S'))
+    parser.add_argument("--patch-size", type=int, nargs=2, default=(256, 256))
+    parser.add_argument("--dataset", type=str, required=True)
+    parser.add_argument("--cuda", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--test-batch-size", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--aux-learning-rate",type=float, default=1e-3)
+    parser.add_argument("--checkpoint", type=str)
+    parser.add_argument("--epochs", type=int, default=400)
+    parser.add_argument("--save", action="store_true", default=True)
+    parser.add_argument("--clip_max_norm", type=float, default=1.0)
+
+    # parser.add_argument("--epochs", type=int, default=400)
+    # parser.add_argument(
+    #     "--lambda",
+    #     dest="lmbda",
+    #     type=float,
+    #     default=1e-2,
+    #     help="Bit-rate distortion parameter (default: %(default)s)",
+    # )
+    # parser.add_argument(
+    #     "--gpu-id",
+    #     type=str,
+    #     default=0,
+    #     help="GPU ids (default: %(default)s)",
+    # )
+    
+    args = parser.parse_args(argv)
+    return args
 
 
-class TrainWrapper(BaseTrainingWrapper):
-    def __init__(self, cfg):
-        super().__init__()
-        self.main(cfg)
+def setup_logger(log_dir):
+    log_formatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s]  %(message)s")
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
 
-    def main(self, cfg):
-        self.cfg = cfg
+    log_file_handler = logging.FileHandler(log_dir, encoding='utf-8')
+    log_file_handler.setFormatter(log_formatter)
+    root_logger.addHandler(log_file_handler)
 
-        # preparation
-        self.set_logging()
-        self.set_device()
-        self.prepare_configs()
-        self.set_dataset()
-        self.set_model()
-        self.set_optimizer()
-        self.set_pretrain()
+    log_stream_handler = logging.StreamHandler(sys.stdout)
+    log_stream_handler.setFormatter(log_formatter)
+    root_logger.addHandler(log_stream_handler)
 
-        # logging
-        self.ema = None
-        if self.is_main:
-            self.set_wandb()
-            self.set_ema()
+    logging.info('Logging file is %s' % log_dir)
 
-        # the main training loops
-        self.training_loops()
 
-    def prepare_configs(self):
-        super().prepare_configs()
-        cfg = self.cfg
-        self.adjust_lr_interval = 10
-        self.ddp_check_interval = cfg.eval_itv
-        self.model_log_interval = cfg.study_itv
-        self.wandb_log_interval = cfg.log_itv
+def configure_optimizers(net, args):
+    """Separate parameters for the main optimizer and the auxiliary optimizer.
+    Return two optimizers"""
 
-    def set_dataset(self):
-        cfg = self.cfg
+    parameters = {
+        n
+        for n, p in net.named_parameters()
+        if not n.endswith(".quantiles") and p.requires_grad
+    }
+    aux_parameters = {
+        n
+        for n, p in net.named_parameters()
+        if n.endswith(".quantiles") and p.requires_grad
+    }
 
-        logging.info('Initializing Datasets and Dataloaders...')
-        trainset = Vimeo90k(n_frames=cfg.tr_frames)
-        trainloader = make_generator(trainset, batch_size=cfg.batch_size, workers=cfg.workers)
-        logging.info(f'Training root: {trainset.root}')
-        logging.info(f'Number of training images = {len(trainset)}')
-        logging.info(f'Training transform: \n{str(trainset.transform)}')
+    # Make sure we don't have an intersection of parameters
+    params_dict = dict(net.named_parameters())
+    inter_params = parameters & aux_parameters
+    union_params = parameters | aux_parameters
 
-        self._epoch_len  = len(trainset) / cfg.bs_effective
-        self.trainloader = trainloader
-        # self.valloader   = valloader
-        self.cfg.epochs  = float(cfg.iterations / self._epoch_len)
+    assert len(inter_params) == 0
+    assert len(union_params) - len(params_dict.keys()) == 0
 
-    def training_loops(self):
-        cfg = self.cfg
+    optimizer = optim.Adam(
+        (params_dict[n] for n in sorted(parameters)),
+        lr=args.learning_rate,
+    )
+    aux_optimizer = optim.Adam(
+        (params_dict[n] for n in sorted(aux_parameters)),
+        lr=args.aux_learning_rate,
+    )
+    return optimizer, aux_optimizer
 
-        if self.distributed: # DDP mode
-            self.model = DDP(self.model, device_ids=[self.local_rank], output_device=self.local_rank)
-        model = self.model.train()
 
-        # ======================== initialize logging ========================
-        pbar = range(self._cur_iter, cfg.iterations)
-        if self.is_main:
-            pbar = tqdm(pbar)
-            self.init_progress_table()
-        # ======================== start training ========================
-        for step in pbar:
-            self._cur_iter  = step
-            self._cur_epoch = step / self._epoch_len
+def compute_aux_loss(aux_list: List, backward=False):
+    aux_loss_sum = 0
+    for aux_loss in aux_list:
+        aux_loss_sum += aux_loss
 
-            # evaluation
-            if self.is_main:
-                if cfg.eval_itv <= 0: # no evaluation
-                    pass
-                elif (step == 0) and (not cfg.eval_first): # first iteration
-                    pass
-                elif step % cfg.eval_itv == 0: # evaluate every {cfg.eval_itv} epochs
-                    self.evaluate()
-                    model.train()
-                    print(self._pbar_header)
+        if backward is True:
+            aux_loss.backward()
 
-            # learning rate schedule
-            if step % self.adjust_lr_interval == 0:
-                self.adjust_lr(step, cfg.iterations)
+    return aux_loss_sum
 
-            # training step
-            assert model.training
-            batch = next(self.trainloader)
-            stats = model(batch)
-            loss = stats['loss'] / float(cfg.accum_num)
-            loss.backward() # gradients are averaged over devices in DDP mode
-            # parameter update
-            if step % cfg.accum_num == 0:
-                grad_norm, bad = self.gradient_clip(model.parameters())
-                self.optimizer.step()
-                self.optimizer.zero_grad()
 
-                if (self.ema is not None) and (not bad):
-                    _warmup = cfg.ema_warmup or (cfg.iterations // 20)
-                    self.ema.decay = cfg.ema_decay * (1 - math.exp(-step / _warmup))
-                    self.ema.update(model)
+def train_one_epoch(
+    model, train_dataloader, optimizer, aux_optimizer, clip_max_norm
+):
+    model.train()
+    device = next(model.parameters()).device
 
-            # sanity check
-            if torch.isnan(loss).any() or torch.isinf(loss).any():
-                logging.error(f'loss = {loss}')
-                self.clean_and_exit()
+    for i, batch in enumerate(train_dataloader):
+        d = [frames.to(device) for frames in batch]
 
-            # logging
-            if self.is_main:
-                self.minibatch_log(pbar, stats)
-                self.periodic_log(batch)
+        optimizer.zero_grad()
+        aux_optimizer.zero_grad()
 
-        self._cur_iter += 1
-        if self.is_main:
-            self.evaluate()
-            logging.info(f'Training finished. results: \n {self._results}')
+        dpb = {
+                    "ref_frame": d[0],
+                    "ref_feature": None,
+                    "ref_y": None,
+                    "ref_mv_y": None,
+                }
 
-    def periodic_log(self, batch):
-        assert self.is_main
-        # model logging
-        if self._cur_iter % self.model_log_interval == 0:
-            self.model.eval()
-            model = unwrap_model(self.model)
-            if hasattr(model, 'study'):
-                model.study(log_dir=self._log_dir/'study', wandb_run=self.wbrun)
-                # self.ema.module.study(log_dir=self._log_dir/'ema')
-            self.model.train()
+        print(d[1].shape)
+        result = model(d[1], dpb)
 
-        # Weights & Biases logging
-        if self._cur_iter % self.wandb_log_interval == 0:
-            imgs = batch if torch.is_tensor(batch) else batch[0]
-            assert torch.is_tensor(imgs)
-            N = min(16, imgs.shape[0])
-            tv.utils.save_image(imgs[:N], fp=self._log_dir / 'inputs.png', nrow=math.ceil(N**0.5))
+        out_criterion = criterion(out_net, d)
+        out_criterion["loss"].backward()
+        if clip_max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
+        optimizer.step()
 
-            _log_dic = {
-                'general/lr': self.optimizer.param_groups[0]['lr'],
-                # 'general/grad_norm': self._moving_max_grad_norm,
-                'general/grad_norm': self._moving_grad_norm_buffer.max(),
-                'ema/decay': (self.ema.decay if self.ema else 0)
-            }
-            _log_dic.update(
-                {'train/'+k: self.stats_table[k] for k in self.wandb_log_keys}
+        aux_loss = compute_aux_loss(model.aux_loss(), backward=True)
+        aux_optimizer.step()
+        
+        if i*len(d) % 5000 == 0:
+            logging.info(
+                f'[{i*len(d)}/{len(train_dataloader.dataset)}] | '
+                # f'Loss: {stats["loss"]:.3f} | '
+                # f'MSE loss: {stats["mse"]:.5f} | '
+                # f'Bpp loss: {stats["kl"]:.4f}'
+
+
+                # f"\tLoss: {out_criterion["loss"].item():.3f} |"
+                # f"\tMSE loss: {out_criterion["mse_loss"].item():.3f} |"
+                # f"\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |"
+                # f"\tAux loss: {aux_loss.item():.2f}"
             )
-            self.wbrun.log(_log_dic, step=self._cur_iter)
-
-    def eval_model(self, model):
-        cfg = self.cfg
-        results = model.self_evaluate(cfg.valset, max_frames=cfg.val_frames,
-                                      log_dir=self._log_dir/'study')
-        return results
 
 
-def main():
-    cfg = parse_args()
-    TrainWrapper(cfg)
+class AverageMeter:
+    """Compute running average."""
+
+    def __init__(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+def test_epoch(epoch, test_dataloader, model):
+    model.eval()
+    device = next(model.parameters()).device
+
+    loss = AverageMeter()
+    bpp_loss = AverageMeter()
+    mse_loss = AverageMeter()
+
+    with torch.no_grad():
+        for d in test_dataloader:
+            d = d.to(device)
+            stats = model(d)
+            # out_criterion = criterion(out_net, d)
+
+            bpp_loss.update(stats["kl"])
+            loss.update(stats["loss"])
+            mse_loss.update(stats["mse"])
+
+    logging.info(
+        f"Test epoch {epoch}: Average losses: "
+        f"Loss: {loss.avg:.3f} | "
+        f"MSE loss: {mse_loss.avg:.5f} | "
+        f"Bpp loss: {bpp_loss.avg:.4f}\n"
+    )
+
+    return loss.avg
+
+
+def save_checkpoint(state, is_best, base_dir, filename="checkpoint.pth.tar"):
+    torch.save(state, base_dir+filename)
+    if is_best:
+        shutil.copyfile(base_dir+filename, base_dir+"checkpoint_best_loss.pth.tar")
+
+
+def main(argv):
+    args = parse_args(argv)
+
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        random.seed(args.seed)
+
+    base_dir = f'./checkpoint/{args.model}/{args.quality_level}/'
+    os.makedirs(base_dir, exist_ok=True)
+
+    setup_logger(base_dir + time.strftime('%Y%m%d_%H%M%S') + '.log')
+    msg = f'======================= {args.name} ======================='
+    logging.info(msg)
+    for k in args.__dict__:
+        logging.info(k + ':' + str(args.__dict__[k]))
+    logging.info('=' * len(msg))
+
+    # Warning, the order of the transform composition should be kept.
+    train_transforms = transforms.Compose(
+        [transforms.ToTensor(), transforms.RandomCrop(args.patch_size)]
+    )
+
+    test_transforms = transforms.Compose(
+        [transforms.ToTensor(), transforms.CenterCrop(args.patch_size)]
+    )
+
+    train_dataset = VideoFolder(
+        args.dataset,
+        rnd_interval=True,
+        rnd_temp_order=True,
+        split="train",
+        transform=train_transforms,
+    )
+    test_dataset = VideoFolder(
+        args.dataset,
+        rnd_interval=False,
+        rnd_temp_order=False,
+        split="test",
+        transform=test_transforms,
+    )
+
+    device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
+    
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=True,
+        pin_memory=(device == "cuda"),
+    )
+
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=args.test_batch_size,
+        num_workers=args.num_workers,
+        shuffle=False,
+        pin_memory=(device == "cuda"),
+    )
+
+    model = Bench()
+    model = model.to(device)
+
+    optimizer, aux_optimizer = configure_optimizers(model, args)
+    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[300,], gamma=0.1)
+
+    last_epoch = 0
+    if args.checkpoint:  # load from previous checkpoint
+        print("Loading", args.checkpoint)
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+        last_epoch = checkpoint["epoch"] + 1
+        model.load_state_dict(checkpoint["state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
+        lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+
+    best_loss = float("inf")
+    for epoch in range(last_epoch, args.epochs):
+        print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
+        train_one_epoch(
+            model,
+            train_dataloader,
+            optimizer,
+            aux_optimizer,
+            args.clip_max_norm,
+        )
+        # loss = test_epoch(epoch, test_dataloader, model)
+        # lr_scheduler.step(loss)
+
+        # is_best = loss < best_loss
+        # best_loss = min(loss, best_loss)
+
+        # if args.save:
+        #     save_checkpoint(
+        #         {
+        #             "epoch": epoch,
+        #             "state_dict": model.state_dict(),
+        #             "loss": loss,
+        #             "optimizer": optimizer.state_dict(),
+        #             "aux_optimizer": aux_optimizer.state_dict(),
+        #             "lr_scheduler": lr_scheduler.state_dict(),
+        #         },
+        #         is_best,
+        #     )
 
 if __name__ == '__main__':
-    main()
+    main(sys.argv[1:])
