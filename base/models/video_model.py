@@ -8,7 +8,8 @@ import torch.nn as nn
 
 from compressai.entropy_models import EntropyBottleneck
 
-from .modules import ME_Spynet, get_enc_dec_models, get_hyper_enc_dec_models
+from .modules import get_enc_dec_models, get_hyper_enc_dec_models
+from ..layers import ME_Spynet
 
 # from .video_net import ME_Spynet, flow_warp, ResBlock, bilineardownsacling, LowerBound, UNet, \
 #     get_enc_dec_models, get_hyper_enc_dec_models
@@ -17,7 +18,7 @@ from .modules import ME_Spynet, get_enc_dec_models, get_hyper_enc_dec_models
 #     get_rounded_q, get_state_dict
 
 
-class Bench(nn.Module):
+class Base(nn.Module):
     def __init__(self):
         super().__init__()
         # y_distribution='laplace'
@@ -36,37 +37,38 @@ class Bench(nn.Module):
         self.mv_encoder, self.mv_decoder = get_enc_dec_models(2, 2, channel_mv)
         self.mv_hyper_prior_encoder, self.mv_hyper_prior_decoder = \
             get_hyper_enc_dec_models(channel_mv, channel_N)
+        self.bit_estimator_z_mv = EntropyBottleneck(channel_N)
 
         self.mv_y_prior_fusion = nn.Sequential(
             nn.Conv2d(channel_mv * 3, channel_mv * 3, 3, stride=1, padding=1),
             nn.LeakyReLU(0.2),
             nn.Conv2d(channel_mv * 3, channel_mv * 3, 3, stride=1, padding=1),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(channel_mv * 3, channel_mv * 3, 3, stride=1, padding=1)
+            nn.Conv2d(channel_mv * 3, channel_mv * 2, 3, stride=1, padding=1)
         )
 
-        self.mv_y_spatial_prior = nn.Sequential(
-            nn.Conv2d(channel_mv * 4, channel_mv * 3, 3, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(channel_mv * 3, channel_mv * 3, 3, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(channel_mv * 3, channel_mv * 2, 3, padding=1)
-        )
+        # self.mv_y_spatial_prior = nn.Sequential(
+        #     nn.Conv2d(channel_mv * 4, channel_mv * 3, 3, padding=1),
+        #     nn.LeakyReLU(0.2),
+        #     nn.Conv2d(channel_mv * 3, channel_mv * 3, 3, padding=1),
+        #     nn.LeakyReLU(0.2),
+        #     nn.Conv2d(channel_mv * 3, channel_mv * 2, 3, padding=1)
+        # )
 
-        self.feature_adaptor_I = nn.Conv2d(3, channel_N, 3, stride=1, padding=1)
-        self.feature_adaptor_P = nn.Conv2d(channel_N, channel_N, 1)
+        # self.feature_adaptor_I = nn.Conv2d(3, channel_N, 3, stride=1, padding=1)
+        # self.feature_adaptor_P = nn.Conv2d(channel_N, channel_N, 1)
         # self.feature_extractor = FeatureExtractor()
         # self.context_fusion_net = MultiScaleContextFusion()
 
         # self.contextual_encoder = ContextualEncoder(channel_N=channel_N, channel_M=channel_M)
 
-        self.contextual_hyper_prior_encoder = nn.Sequential(
-            nn.Conv2d(channel_M, channel_N, 3, stride=1, padding=1),
-            nn.LeakyReLU(),
-            nn.Conv2d(channel_N, channel_N, 3, stride=2, padding=1),
-            nn.LeakyReLU(),
-            nn.Conv2d(channel_N, channel_N, 3, stride=2, padding=1),
-        )
+        # self.contextual_hyper_prior_encoder = nn.Sequential(
+        #     nn.Conv2d(channel_M, channel_N, 3, stride=1, padding=1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(channel_N, channel_N, 3, stride=2, padding=1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(channel_N, channel_N, 3, stride=2, padding=1),
+        # )
 
         # self.contextual_hyper_prior_decoder = nn.Sequential(
         #     conv3x3(channel_N, channel_M),
@@ -80,30 +82,31 @@ class Bench(nn.Module):
         #     conv3x3(channel_M * 3 // 2, channel_M * 2),
         # )
 
-        self.temporal_prior_encoder = nn.Sequential(
-            nn.Conv2d(channel_N, channel_M * 3 // 2, 3, stride=2, padding=1),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(channel_M * 3 // 2, channel_M * 2, 3, stride=2, padding=1),
-        )
+        # self.temporal_prior_encoder = nn.Sequential(
+        #     nn.Conv2d(channel_N, channel_M * 3 // 2, 3, stride=2, padding=1),
+        #     nn.LeakyReLU(0.1),
+        #     nn.Conv2d(channel_M * 3 // 2, channel_M * 2, 3, stride=2, padding=1),
+        # )
 
-        self.y_prior_fusion = nn.Sequential(
-            nn.Conv2d(channel_M * 5, channel_M * 4, 3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(channel_M * 4, channel_M * 3, 3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(channel_M * 3, channel_M * 3, 3, stride=1, padding=1)
-        )
+        # self.y_prior_fusion = nn.Sequential(
+        #     nn.Conv2d(channel_M * 5, channel_M * 4, 3, stride=1, padding=1),
+        #     nn.LeakyReLU(0.2),
+        #     nn.Conv2d(channel_M * 4, channel_M * 3, 3, stride=1, padding=1),
+        #     nn.LeakyReLU(0.2),
+        #     nn.Conv2d(channel_M * 3, channel_M * 3, 3, stride=1, padding=1)
+        # )
 
-        self.y_spatial_prior = nn.Sequential(
-            nn.Conv2d(channel_M * 4, channel_M * 3, 3, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(channel_M * 3, channel_M * 3, 3, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(channel_M * 3, channel_M * 2, 3, padding=1)
-        )
+        # self.y_spatial_prior = nn.Sequential(
+        #     nn.Conv2d(channel_M * 4, channel_M * 3, 3, padding=1),
+        #     nn.LeakyReLU(0.2),
+        #     nn.Conv2d(channel_M * 3, channel_M * 3, 3, padding=1),
+        #     nn.LeakyReLU(0.2),
+        #     nn.Conv2d(channel_M * 3, channel_M * 2, 3, padding=1)
+        # )
 
-        self.bit_estimator_z = EntropyBottleneck(channel_mv)
-        self.bit_estimator_z_mv = EntropyBottleneck(channel_N)
+        
+
+        # self.bit_estimator_z = EntropyBottleneck(channel_mv)
         
         # self.contextual_decoder = ContextualDecoder(channel_N=channel_N, channel_M=channel_M)
         # self.recon_generation_net = ReconGeneration()
@@ -139,15 +142,17 @@ class Bench(nn.Module):
         est_mv = self.optic_flow(x, ref_frame)
         mv_y = self.mv_encoder(est_mv)
         mv_z = self.mv_hyper_prior_encoder(mv_y)
-        mv_z_hat, mv_z_likelihoods = self.bit_estimator_z(mv_z)
+        mv_z_hat, mv_z_likelihoods = self.bit_estimator_z_mv(mv_z)
         mv_params = self.mv_hyper_prior_decoder(mv_z_hat)
 
-        
         ref_mv_y = dpb["ref_mv_y"]
         if ref_mv_y is None:
             ref_mv_y = torch.zeros_like(mv_y)
         mv_params = torch.cat((mv_params, ref_mv_y), dim=1)
-        mv_q_step, mv_scales, mv_means = self.mv_y_prior_fusion(mv_params).chunk(3, 1)
+        mv_scales, mv_means = self.mv_y_prior_fusion(mv_params).chunk(3, 1)
+
+
+        
         mv_y_res, mv_y_q, mv_y_hat, mv_scales_hat = self.forward_dual_prior(
             mv_y, mv_means, mv_scales, mv_q_step, self.mv_y_spatial_prior)
 

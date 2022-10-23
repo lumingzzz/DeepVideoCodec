@@ -1,4 +1,4 @@
-python train_video.py --model benchmark \
+python train_video.py --model base \
                       --dataset /workspace/shared/vimeo_septuplet \
                       --cuda \
                       --batch-size 8 \

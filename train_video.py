@@ -15,13 +15,13 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from benchmark.datasets import VideoFolder
-from benchmark.models import Bench
+from benchmark.models import Base
 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="Example training script.")
     parser.add_argument("--seed", type=float)
-    parser.add_argument("--model", type=str, default="benchmark")
+    parser.add_argument("--model", type=str, default="base")
     parser.add_argument("--quality-level", type=int, default=3)
     parser.add_argument('--name', type=str, default=datetime.now().strftime('%Y-%m-%d_%H_%M_%S'))
     parser.add_argument("--patch-size", type=int, nargs=2, default=(256, 256))
@@ -271,7 +271,7 @@ def main(argv):
         pin_memory=(device == "cuda"),
     )
 
-    model = Bench()
+    model = Base()
     model = model.to(device)
 
     optimizer, aux_optimizer = configure_optimizers(model, args)
