@@ -6,6 +6,6 @@ python train_video.py --model base \
                       --learning-rate 1e-4 \
                       --epochs 400 \
                       --save \
-                    #   --checkpoint /workspace/lm/NeuralVideoCoding/checkpoint/base/1024/checkpoint.pth.tar
+                      --checkpoint /workspace/lm/lossyvae-video/checkpoints/base/0.0067/checkpoint_best_loss.pth.tar
 
 

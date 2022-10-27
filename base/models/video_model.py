@@ -36,7 +36,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from compressai.entropy_models import GaussianConditional
-from compressai.layers import QReLU
+from ..layers import QReLU, ME_Spynet, flow_warp
 
 from .base_model import CompressionModel, get_scale_table
 from .utils import (
@@ -186,6 +186,7 @@ class BaseModel(nn.Module):
         self.res_decoder = Decoder(3, in_planes=384)
         self.res_hyperprior = Hyperprior()
 
+        self.optic_flow = ME_Spynet()
         self.motion_encoder = Encoder(2)
         self.motion_decoder = Decoder(2)
         self.motion_hyperprior = Hyperprior()
@@ -234,13 +235,13 @@ class BaseModel(nn.Module):
 
     def forward_inter(self, x_cur, x_ref):
         # encode the motion information
-        x = torch.cat((x_cur, x_ref), dim=1)
-        y_motion = self.motion_encoder(x)
+        est_mv = self.optic_flow(x_cur, x_ref)
+        y_motion = self.motion_encoder(est_mv)
         y_motion_hat, motion_likelihoods = self.motion_hyperprior(y_motion)
 
         # decode the space-scale flow information
-        motion_info = self.motion_decoder(y_motion_hat)
-        x_pred = self.forward_prediction(x_ref, motion_info)
+        motion = self.motion_decoder(y_motion_hat)
+        x_pred = self.motion_compensation(x_ref, motion)
 
         # residual
         x_res = x_cur - x_pred
@@ -263,8 +264,8 @@ class BaseModel(nn.Module):
         y_motion_hat, out_motion = self.motion_hyperprior.compress(y_motion)
 
         # decode the space-scale flow information
-        motion_info = self.motion_decoder(y_motion_hat)
-        x_pred = self.forward_prediction(x_ref, motion_info)
+        motion = self.motion_decoder(y_motion_hat)
+        x_pred = self.motion_compensation(x_ref, motion)
 
         # residual
         x_res = x_cur - x_pred
@@ -291,8 +292,8 @@ class BaseModel(nn.Module):
         y_motion_hat = self.motion_hyperprior.decompress(strings[key], shapes[key])
 
         # decode the space-scale flow information
-        motion_info = self.motion_decoder(y_motion_hat)
-        x_pred = self.forward_prediction(x_ref, motion_info)
+        motion = self.motion_decoder(y_motion_hat)
+        x_pred = self.motion_compensation(x_ref, motion)
 
         # residual
         key = "residual"
@@ -307,58 +308,9 @@ class BaseModel(nn.Module):
 
         return x_rec
 
-    # @staticmethod
-    # def gaussian_volume(x, sigma: float, num_levels: int):
-    #     """Efficient gaussian volume construction.
-
-    #     From: "Generative Video Compression as Hierarchical Variational Inference",
-    #     by Yang et al.
-    #     """
-    #     k = 2 * int(math.ceil(3 * sigma)) + 1
-    #     device = x.device
-    #     dtype = x.dtype if torch.is_floating_point(x) else torch.float32
-
-    #     kernel = gaussian_kernel2d(k, sigma, device=device, dtype=dtype)
-    #     volume = [x.unsqueeze(2)]
-    #     x = gaussian_blur(x, kernel=kernel)
-    #     volume += [x.unsqueeze(2)]
-    #     for i in range(1, num_levels):
-    #         x = F.avg_pool2d(x, kernel_size=(2, 2), stride=(2, 2))
-    #         x = gaussian_blur(x, kernel=kernel)
-    #         interp = x
-    #         for _ in range(0, i):
-    #             interp = F.interpolate(
-    #                 interp, scale_factor=2, mode="bilinear", align_corners=False
-    #             )
-    #         volume.append(interp.unsqueeze(2))
-    #     return torch.cat(volume, dim=2)
-
-    # @amp.autocast(enabled=False)
-    # def warp_volume(self, volume, flow, scale_field, padding_mode: str = "border"):
-    #     """3D volume warping."""
-    #     if volume.ndimension() != 5:
-    #         raise ValueError(
-    #             f"Invalid number of dimensions for volume {volume.ndimension()}"
-    #         )
-
-    #     N, C, _, H, W = volume.size()
-
-    #     grid = meshgrid2d(N, C, H, W, volume.device)
-    #     update_grid = grid + flow.permute(0, 2, 3, 1).float()
-    #     update_scale = scale_field.permute(0, 2, 3, 1).float()
-    #     volume_grid = torch.cat((update_grid, update_scale), dim=-1).unsqueeze(1)
-
-    #     out = F.grid_sample(
-    #         volume.float(), volume_grid, padding_mode=padding_mode, align_corners=False
-    #     )
-    #     return out.squeeze(2)
-
-    def forward_prediction(self, x_ref, motion_info):
-        flow, scale_field = motion_info.chunk(2, dim=1)
-
-        volume = self.gaussian_volume(x_ref, self.sigma0, self.num_levels)
-        x_pred = self.warp_volume(volume, flow, scale_field)
-        return x_pred
+    def motion_compensation(self, x_ref, mv):
+        warpframe = flow_warp(x_ref, mv)
+        return warpframe
 
     def aux_loss(self):
         """Return a list of the auxiliary entropy bottleneck over module(s)."""
@@ -413,7 +365,7 @@ class BaseModel(nn.Module):
 
         return dec_frames
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, strict=True):
 
         # Dynamically update the entropy bottleneck buffers related to the CDFs
         update_registered_buffers(
@@ -455,7 +407,7 @@ class BaseModel(nn.Module):
             state_dict,
         )
 
-        super().load_state_dict(state_dict)
+        super().load_state_dict(state_dict, strict)
 
     @classmethod
     def from_state_dict(cls, state_dict):

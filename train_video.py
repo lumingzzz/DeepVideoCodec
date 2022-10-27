@@ -271,13 +271,16 @@ def train_one_epoch(
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
-        out_net = model.forward_keyframe(d[0])
-        out_net = {
-            "x_hat": [out_net[0]],
-            "likelihoods": [out_net[1]],
-        }
-
-        out_criterion = criterion(out_net, [d[0]])
+        # out_net = model.forward_keyframe(d[0])
+        # out_net = {
+        #     "x_hat": [out_net[0]],
+        #     "likelihoods": [out_net[1]],
+        # }
+        # out_criterion = criterion(out_net, [d[0]])
+        
+        out_net = model(d)
+        out_criterion = criterion(out_net, d)
+        
         out_criterion["loss"].backward()
         if clip_max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
@@ -308,17 +311,21 @@ def test_epoch(epoch, test_dataloader, model, criterion):
     with torch.no_grad():
         for batch in test_dataloader:
             d = [frames.to(device) for frames in batch]
-            out_net = model.forward_keyframe(d[0])
-            out_net = {
-            "x_hat": [out_net[0]],
-            "likelihoods": [out_net[1]],
-        }
-            out_criterion = criterion(out_net, [d[0]])
+            
+        #     out_net = model.forward_keyframe(d[0])
+        #     out_net = {
+        #     "x_hat": [out_net[0]],
+        #     "likelihoods": [out_net[1]],
+        # }
+        #     out_criterion = criterion(out_net, [d[0]])
+            
+            out_net = model(d)
+            out_criterion = criterion(out_net, d)
 
             aux_loss.update(compute_aux_loss(model.aux_loss()))
             bpp_loss.update(out_criterion["bpp_loss"])
-            mse_loss.update(out_criterion["mse_loss"])
             loss.update(out_criterion["loss"])
+            mse_loss.update(out_criterion["mse_loss"])
 
     logging.info(
         f"Test epoch {epoch}: Average losses: "
@@ -407,11 +414,11 @@ def main(argv):
     if args.checkpoint:  # load from previous checkpoint
         print("Loading", args.checkpoint)
         checkpoint = torch.load(args.checkpoint, map_location=device)
-        last_epoch = checkpoint["epoch"] + 1
-        model.load_state_dict(checkpoint["state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
-        lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+        # last_epoch = checkpoint["epoch"] + 1
+        model.load_state_dict(checkpoint["state_dict"], strict=False)
+        # optimizer.load_state_dict(checkpoint["optimizer"])
+        # aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
+        # lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
 
     best_loss = float("inf")
     for epoch in range(last_epoch, args.epochs):
