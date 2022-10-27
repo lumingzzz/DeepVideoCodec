@@ -1,233 +1,487 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# Copyright (c) 2021-2022, InterDigital Communications, Inc
+# All rights reserved.
 
-# import time
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted (subject to the limitations in the disclaimer
+# below) provided that the following conditions are met:
+
+# * Redistributions of source code must retain the above copyright notice,
+#   this list of conditions and the following disclaimer.
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+# * Neither the name of InterDigital Communications, Inc nor the names of its
+#   contributors may be used to endorse or promote products derived from this
+#   software without specific prior written permission.
+
+# NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED BY
+# THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+# CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT
+# NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+# PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+# OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+# OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+# ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# import math
+
+from typing import List
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from compressai.entropy_models import EntropyBottleneck
+from compressai.entropy_models import GaussianConditional
+from compressai.layers import QReLU
 
-from .modules import get_enc_dec_models, get_hyper_enc_dec_models
-from ..layers import ME_Spynet
+from .base_model import CompressionModel, get_scale_table
+from .utils import (
+    conv,
+    deconv,
+    quantize_ste,
+    update_registered_buffers,
+)
 
-# from .video_net import ME_Spynet, flow_warp, ResBlock, bilineardownsacling, LowerBound, UNet, \
-#     get_enc_dec_models, get_hyper_enc_dec_models
-# from ..layers.layers import conv3x3, subpel_conv1x1, subpel_conv3x3
-# from ..utils.stream_helper import get_downsampled_shape, encode_p, decode_p, filesize, \
-#     get_rounded_q, get_state_dict
 
-
-class Base(nn.Module):
+class BaseModel(nn.Module):
     def __init__(self):
         super().__init__()
-        # y_distribution='laplace'
-        channel_mv = 64
-        channel_N = 64
-        channel_M = 96
-        # z_channel=64
-        # mv_z_channel=64
 
-        self.channel_mv = channel_mv
-        self.channel_N = channel_N
-        self.channel_M = channel_M
+        class Encoder(nn.Sequential):
+            def __init__(
+                self, in_planes: int, mid_planes: int = 128, out_planes: int = 192
+            ):
+                super().__init__(
+                    conv(in_planes, mid_planes, kernel_size=5, stride=2),
+                    nn.ReLU(inplace=True),
+                    conv(mid_planes, mid_planes, kernel_size=5, stride=2),
+                    nn.ReLU(inplace=True),
+                    conv(mid_planes, mid_planes, kernel_size=5, stride=2),
+                    nn.ReLU(inplace=True),
+                    conv(mid_planes, out_planes, kernel_size=5, stride=2),
+                )
 
-        self.optic_flow = ME_Spynet()
+        class Decoder(nn.Sequential):
+            def __init__(
+                self, out_planes: int, in_planes: int = 192, mid_planes: int = 128
+            ):
+                super().__init__(
+                    deconv(in_planes, mid_planes, kernel_size=5, stride=2),
+                    nn.ReLU(inplace=True),
+                    deconv(mid_planes, mid_planes, kernel_size=5, stride=2),
+                    nn.ReLU(inplace=True),
+                    deconv(mid_planes, mid_planes, kernel_size=5, stride=2),
+                    nn.ReLU(inplace=True),
+                    deconv(mid_planes, out_planes, kernel_size=5, stride=2),
+                )
 
-        self.mv_encoder, self.mv_decoder = get_enc_dec_models(2, 2, channel_mv)
-        self.mv_hyper_prior_encoder, self.mv_hyper_prior_decoder = \
-            get_hyper_enc_dec_models(channel_mv, channel_N)
-        self.bit_estimator_z_mv = EntropyBottleneck(channel_N)
+        class HyperEncoder(nn.Sequential):
+            def __init__(
+                self, in_planes: int = 192, mid_planes: int = 192, out_planes: int = 192
+            ):
+                super().__init__(
+                    conv(in_planes, mid_planes, kernel_size=5, stride=2),
+                    nn.ReLU(inplace=True),
+                    conv(mid_planes, mid_planes, kernel_size=5, stride=2),
+                    nn.ReLU(inplace=True),
+                    conv(mid_planes, mid_planes, kernel_size=5, stride=2),
+                )
 
-        self.mv_y_prior_fusion = nn.Sequential(
-            nn.Conv2d(channel_mv * 3, channel_mv * 3, 3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(channel_mv * 3, channel_mv * 3, 3, stride=1, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(channel_mv * 3, channel_mv * 2, 3, stride=1, padding=1)
+        class HyperDecoder(nn.Sequential):
+            def __init__(
+                self, in_planes: int = 192, mid_planes: int = 192, out_planes: int = 192
+            ):
+                super().__init__(
+                    deconv(in_planes, mid_planes, kernel_size=5, stride=2),
+                    nn.ReLU(inplace=True),
+                    deconv(mid_planes, mid_planes, kernel_size=5, stride=2),
+                    nn.ReLU(inplace=True),
+                    deconv(mid_planes, out_planes, kernel_size=5, stride=2),
+                )
+
+        class HyperDecoderWithQReLU(nn.Module):
+            def __init__(
+                self, in_planes: int = 192, mid_planes: int = 192, out_planes: int = 192
+            ):
+                super().__init__()
+
+                def qrelu(input, bit_depth=8, beta=100):
+                    return QReLU.apply(input, bit_depth, beta)
+
+                self.deconv1 = deconv(in_planes, mid_planes, kernel_size=5, stride=2)
+                self.qrelu1 = qrelu
+                self.deconv2 = deconv(mid_planes, mid_planes, kernel_size=5, stride=2)
+                self.qrelu2 = qrelu
+                self.deconv3 = deconv(mid_planes, out_planes, kernel_size=5, stride=2)
+                self.qrelu3 = qrelu
+
+            def forward(self, x):
+                x = self.qrelu1(self.deconv1(x))
+                x = self.qrelu2(self.deconv2(x))
+                x = self.qrelu3(self.deconv3(x))
+
+                return x
+
+        class Hyperprior(CompressionModel):
+            def __init__(self, planes: int = 192, mid_planes: int = 192):
+                super().__init__(entropy_bottleneck_channels=mid_planes)
+                self.hyper_encoder = HyperEncoder(planes, mid_planes, planes)
+                self.hyper_decoder_mean = HyperDecoder(planes, mid_planes, planes)
+                self.hyper_decoder_scale = HyperDecoderWithQReLU(
+                    planes, mid_planes, planes
+                )
+                self.gaussian_conditional = GaussianConditional(None)
+
+            def forward(self, y):
+                z = self.hyper_encoder(y)
+                _, z_likelihoods = self.entropy_bottleneck(z)
+
+                z_offset = self.entropy_bottleneck._get_medians()
+                z_tmp = z - z_offset
+                z_hat = quantize_ste(z_tmp) + z_offset
+
+                scales = self.hyper_decoder_scale(z_hat)
+                means = self.hyper_decoder_mean(z_hat)
+                _, y_likelihoods = self.gaussian_conditional(y, scales, means)
+                y_hat = quantize_ste(y - means) + means
+                return y_hat, {"y": y_likelihoods, "z": z_likelihoods}
+
+            def compress(self, y):
+                z = self.hyper_encoder(y)
+
+                z_string = self.entropy_bottleneck.compress(z)
+                z_hat = self.entropy_bottleneck.decompress(z_string, z.size()[-2:])
+
+                scales = self.hyper_decoder_scale(z_hat)
+                means = self.hyper_decoder_mean(z_hat)
+
+                indexes = self.gaussian_conditional.build_indexes(scales)
+                y_string = self.gaussian_conditional.compress(y, indexes, means)
+                y_hat = self.gaussian_conditional.quantize(y, "dequantize", means)
+
+                return y_hat, {"strings": [y_string, z_string], "shape": z.size()[-2:]}
+
+            def decompress(self, strings, shape):
+                assert isinstance(strings, list) and len(strings) == 2
+                z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
+
+                scales = self.hyper_decoder_scale(z_hat)
+                means = self.hyper_decoder_mean(z_hat)
+                indexes = self.gaussian_conditional.build_indexes(scales)
+                y_hat = self.gaussian_conditional.decompress(
+                    strings[0], indexes, z_hat.dtype, means
+                )
+
+                return y_hat
+
+        self.img_encoder = Encoder(3)
+        self.img_decoder = Decoder(3)
+        self.img_hyperprior = Hyperprior()
+
+        self.res_encoder = Encoder(3)
+        self.res_decoder = Decoder(3, in_planes=384)
+        self.res_hyperprior = Hyperprior()
+
+        self.motion_encoder = Encoder(2)
+        self.motion_decoder = Decoder(2)
+        self.motion_hyperprior = Hyperprior()
+
+    def forward(self, frames):
+        if not isinstance(frames, List):
+            raise RuntimeError(f"Invalid number of frames: {len(frames)}.")
+
+        reconstructions = []
+        frames_likelihoods = []
+
+        x_hat, likelihoods = self.forward_keyframe(frames[0])
+        reconstructions.append(x_hat)
+        frames_likelihoods.append(likelihoods)
+        x_ref = x_hat.detach()  # stop gradient flow (cf: google2020 paper)
+
+        for i in range(1, len(frames)):
+            x = frames[i]
+            x_ref, likelihoods = self.forward_inter(x, x_ref)
+            reconstructions.append(x_ref)
+            frames_likelihoods.append(likelihoods)
+
+        return {
+            "x_hat": reconstructions,
+            "likelihoods": frames_likelihoods,
+        }
+
+    def forward_keyframe(self, x):
+        y = self.img_encoder(x)
+        y_hat, likelihoods = self.img_hyperprior(y)
+        x_hat = self.img_decoder(y_hat)
+        return x_hat, {"keyframe": likelihoods}
+
+    def encode_keyframe(self, x):
+        y = self.img_encoder(x)
+        y_hat, out_keyframe = self.img_hyperprior.compress(y)
+        x_hat = self.img_decoder(y_hat)
+
+        return x_hat, out_keyframe
+
+    def decode_keyframe(self, strings, shape):
+        y_hat = self.img_hyperprior.decompress(strings, shape)
+        x_hat = self.img_decoder(y_hat)
+
+        return x_hat
+
+    def forward_inter(self, x_cur, x_ref):
+        # encode the motion information
+        x = torch.cat((x_cur, x_ref), dim=1)
+        y_motion = self.motion_encoder(x)
+        y_motion_hat, motion_likelihoods = self.motion_hyperprior(y_motion)
+
+        # decode the space-scale flow information
+        motion_info = self.motion_decoder(y_motion_hat)
+        x_pred = self.forward_prediction(x_ref, motion_info)
+
+        # residual
+        x_res = x_cur - x_pred
+        y_res = self.res_encoder(x_res)
+        y_res_hat, res_likelihoods = self.res_hyperprior(y_res)
+
+        # y_combine
+        y_combine = torch.cat((y_res_hat, y_motion_hat), dim=1)
+        x_res_hat = self.res_decoder(y_combine)
+
+        # final reconstruction: prediction + residual
+        x_rec = x_pred + x_res_hat
+
+        return x_rec, {"motion": motion_likelihoods, "residual": res_likelihoods}
+
+    def encode_inter(self, x_cur, x_ref):
+        # encode the motion information
+        x = torch.cat((x_cur, x_ref), dim=1)
+        y_motion = self.motion_encoder(x)
+        y_motion_hat, out_motion = self.motion_hyperprior.compress(y_motion)
+
+        # decode the space-scale flow information
+        motion_info = self.motion_decoder(y_motion_hat)
+        x_pred = self.forward_prediction(x_ref, motion_info)
+
+        # residual
+        x_res = x_cur - x_pred
+        y_res = self.res_encoder(x_res)
+        y_res_hat, out_res = self.res_hyperprior.compress(y_res)
+
+        # y_combine
+        y_combine = torch.cat((y_res_hat, y_motion_hat), dim=1)
+        x_res_hat = self.res_decoder(y_combine)
+
+        # final reconstruction: prediction + residual
+        x_rec = x_pred + x_res_hat
+
+        return x_rec, {
+            "strings": {
+                "motion": out_motion["strings"],
+                "residual": out_res["strings"],
+            },
+            "shape": {"motion": out_motion["shape"], "residual": out_res["shape"]},
+        }
+
+    def decode_inter(self, x_ref, strings, shapes):
+        key = "motion"
+        y_motion_hat = self.motion_hyperprior.decompress(strings[key], shapes[key])
+
+        # decode the space-scale flow information
+        motion_info = self.motion_decoder(y_motion_hat)
+        x_pred = self.forward_prediction(x_ref, motion_info)
+
+        # residual
+        key = "residual"
+        y_res_hat = self.res_hyperprior.decompress(strings[key], shapes[key])
+
+        # y_combine
+        y_combine = torch.cat((y_res_hat, y_motion_hat), dim=1)
+        x_res_hat = self.res_decoder(y_combine)
+
+        # final reconstruction: prediction + residual
+        x_rec = x_pred + x_res_hat
+
+        return x_rec
+
+    # @staticmethod
+    # def gaussian_volume(x, sigma: float, num_levels: int):
+    #     """Efficient gaussian volume construction.
+
+    #     From: "Generative Video Compression as Hierarchical Variational Inference",
+    #     by Yang et al.
+    #     """
+    #     k = 2 * int(math.ceil(3 * sigma)) + 1
+    #     device = x.device
+    #     dtype = x.dtype if torch.is_floating_point(x) else torch.float32
+
+    #     kernel = gaussian_kernel2d(k, sigma, device=device, dtype=dtype)
+    #     volume = [x.unsqueeze(2)]
+    #     x = gaussian_blur(x, kernel=kernel)
+    #     volume += [x.unsqueeze(2)]
+    #     for i in range(1, num_levels):
+    #         x = F.avg_pool2d(x, kernel_size=(2, 2), stride=(2, 2))
+    #         x = gaussian_blur(x, kernel=kernel)
+    #         interp = x
+    #         for _ in range(0, i):
+    #             interp = F.interpolate(
+    #                 interp, scale_factor=2, mode="bilinear", align_corners=False
+    #             )
+    #         volume.append(interp.unsqueeze(2))
+    #     return torch.cat(volume, dim=2)
+
+    # @amp.autocast(enabled=False)
+    # def warp_volume(self, volume, flow, scale_field, padding_mode: str = "border"):
+    #     """3D volume warping."""
+    #     if volume.ndimension() != 5:
+    #         raise ValueError(
+    #             f"Invalid number of dimensions for volume {volume.ndimension()}"
+    #         )
+
+    #     N, C, _, H, W = volume.size()
+
+    #     grid = meshgrid2d(N, C, H, W, volume.device)
+    #     update_grid = grid + flow.permute(0, 2, 3, 1).float()
+    #     update_scale = scale_field.permute(0, 2, 3, 1).float()
+    #     volume_grid = torch.cat((update_grid, update_scale), dim=-1).unsqueeze(1)
+
+    #     out = F.grid_sample(
+    #         volume.float(), volume_grid, padding_mode=padding_mode, align_corners=False
+    #     )
+    #     return out.squeeze(2)
+
+    def forward_prediction(self, x_ref, motion_info):
+        flow, scale_field = motion_info.chunk(2, dim=1)
+
+        volume = self.gaussian_volume(x_ref, self.sigma0, self.num_levels)
+        x_pred = self.warp_volume(volume, flow, scale_field)
+        return x_pred
+
+    def aux_loss(self):
+        """Return a list of the auxiliary entropy bottleneck over module(s)."""
+
+        aux_loss_list = []
+        for m in self.modules():
+            if isinstance(m, CompressionModel):
+                aux_loss_list.append(m.aux_loss())
+
+        return aux_loss_list
+
+    def compress(self, frames):
+        if not isinstance(frames, List):
+            raise RuntimeError(f"Invalid number of frames: {len(frames)}.")
+
+        frame_strings = []
+        shape_infos = []
+
+        x_ref, out_keyframe = self.encode_keyframe(frames[0])
+
+        frame_strings.append(out_keyframe["strings"])
+        shape_infos.append(out_keyframe["shape"])
+
+        for i in range(1, len(frames)):
+            x = frames[i]
+            x_ref, out_interframe = self.encode_inter(x, x_ref)
+
+            frame_strings.append(out_interframe["strings"])
+            shape_infos.append(out_interframe["shape"])
+
+        return frame_strings, shape_infos
+
+    def decompress(self, strings, shapes):
+
+        if not isinstance(strings, List) or not isinstance(shapes, List):
+            raise RuntimeError(f"Invalid number of frames: {len(strings)}.")
+
+        assert len(strings) == len(
+            shapes
+        ), f"Number of information should match {len(strings)} != {len(shapes)}."
+
+        dec_frames = []
+
+        x_ref = self.decode_keyframe(strings[0], shapes[0])
+        dec_frames.append(x_ref)
+
+        for i in range(1, len(strings)):
+            string = strings[i]
+            shape = shapes[i]
+            x_ref = self.decode_inter(x_ref, string, shape)
+            dec_frames.append(x_ref)
+
+        return dec_frames
+
+    def load_state_dict(self, state_dict):
+
+        # Dynamically update the entropy bottleneck buffers related to the CDFs
+        update_registered_buffers(
+            self.img_hyperprior.gaussian_conditional,
+            "img_hyperprior.gaussian_conditional",
+            ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
+            state_dict,
+        )
+        update_registered_buffers(
+            self.img_hyperprior.entropy_bottleneck,
+            "img_hyperprior.entropy_bottleneck",
+            ["_quantized_cdf", "_offset", "_cdf_length"],
+            state_dict,
         )
 
-        # self.mv_y_spatial_prior = nn.Sequential(
-        #     nn.Conv2d(channel_mv * 4, channel_mv * 3, 3, padding=1),
-        #     nn.LeakyReLU(0.2),
-        #     nn.Conv2d(channel_mv * 3, channel_mv * 3, 3, padding=1),
-        #     nn.LeakyReLU(0.2),
-        #     nn.Conv2d(channel_mv * 3, channel_mv * 2, 3, padding=1)
-        # )
+        update_registered_buffers(
+            self.res_hyperprior.gaussian_conditional,
+            "res_hyperprior.gaussian_conditional",
+            ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
+            state_dict,
+        )
+        update_registered_buffers(
+            self.res_hyperprior.entropy_bottleneck,
+            "res_hyperprior.entropy_bottleneck",
+            ["_quantized_cdf", "_offset", "_cdf_length"],
+            state_dict,
+        )
 
-        # self.feature_adaptor_I = nn.Conv2d(3, channel_N, 3, stride=1, padding=1)
-        # self.feature_adaptor_P = nn.Conv2d(channel_N, channel_N, 1)
-        # self.feature_extractor = FeatureExtractor()
-        # self.context_fusion_net = MultiScaleContextFusion()
+        update_registered_buffers(
+            self.motion_hyperprior.gaussian_conditional,
+            "motion_hyperprior.gaussian_conditional",
+            ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
+            state_dict,
+        )
+        update_registered_buffers(
+            self.motion_hyperprior.entropy_bottleneck,
+            "motion_hyperprior.entropy_bottleneck",
+            ["_quantized_cdf", "_offset", "_cdf_length"],
+            state_dict,
+        )
 
-        # self.contextual_encoder = ContextualEncoder(channel_N=channel_N, channel_M=channel_M)
+        super().load_state_dict(state_dict)
 
-        # self.contextual_hyper_prior_encoder = nn.Sequential(
-        #     nn.Conv2d(channel_M, channel_N, 3, stride=1, padding=1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(channel_N, channel_N, 3, stride=2, padding=1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(channel_N, channel_N, 3, stride=2, padding=1),
-        # )
+    @classmethod
+    def from_state_dict(cls, state_dict):
+        """Return a new model instance from `state_dict`."""
+        net = cls()
+        net.load_state_dict(state_dict)
+        return net
 
-        # self.contextual_hyper_prior_decoder = nn.Sequential(
-        #     conv3x3(channel_N, channel_M),
-        #     nn.LeakyReLU(),
-        #     subpel_conv1x1(channel_M, channel_M, 2),
-        #     nn.LeakyReLU(),
-        #     conv3x3(channel_M, channel_M * 3 // 2),
-        #     nn.LeakyReLU(),
-        #     subpel_conv1x1(channel_M * 3 // 2, channel_M * 3 // 2, 2),
-        #     nn.LeakyReLU(),
-        #     conv3x3(channel_M * 3 // 2, channel_M * 2),
-        # )
+    def update(self, scale_table=None, force=False):
+        if scale_table is None:
+            scale_table = get_scale_table()
 
-        # self.temporal_prior_encoder = nn.Sequential(
-        #     nn.Conv2d(channel_N, channel_M * 3 // 2, 3, stride=2, padding=1),
-        #     nn.LeakyReLU(0.1),
-        #     nn.Conv2d(channel_M * 3 // 2, channel_M * 2, 3, stride=2, padding=1),
-        # )
+        updated = self.img_hyperprior.gaussian_conditional.update_scale_table(
+            scale_table, force=force
+        )
 
-        # self.y_prior_fusion = nn.Sequential(
-        #     nn.Conv2d(channel_M * 5, channel_M * 4, 3, stride=1, padding=1),
-        #     nn.LeakyReLU(0.2),
-        #     nn.Conv2d(channel_M * 4, channel_M * 3, 3, stride=1, padding=1),
-        #     nn.LeakyReLU(0.2),
-        #     nn.Conv2d(channel_M * 3, channel_M * 3, 3, stride=1, padding=1)
-        # )
+        updated |= self.img_hyperprior.entropy_bottleneck.update(force=force)
 
-        # self.y_spatial_prior = nn.Sequential(
-        #     nn.Conv2d(channel_M * 4, channel_M * 3, 3, padding=1),
-        #     nn.LeakyReLU(0.2),
-        #     nn.Conv2d(channel_M * 3, channel_M * 3, 3, padding=1),
-        #     nn.LeakyReLU(0.2),
-        #     nn.Conv2d(channel_M * 3, channel_M * 2, 3, padding=1)
-        # )
+        updated |= self.res_hyperprior.gaussian_conditional.update_scale_table(
+            scale_table, force=force
+        )
+        updated |= self.res_hyperprior.entropy_bottleneck.update(force=force)
 
-        
+        updated |= self.motion_hyperprior.gaussian_conditional.update_scale_table(
+            scale_table, force=force
+        )
+        updated |= self.motion_hyperprior.entropy_bottleneck.update(force=force)
 
-        # self.bit_estimator_z = EntropyBottleneck(channel_mv)
-        
-        # self.contextual_decoder = ContextualDecoder(channel_N=channel_N, channel_M=channel_M)
-        # self.recon_generation_net = ReconGeneration()
-
-        # self.mv_y_q_basic = nn.Parameter(torch.ones((1, channel_mv, 1, 1)))
-        # self.mv_y_q_scale = nn.Parameter(torch.ones((anchor_num, 1, 1, 1)))
-        # self.y_q_basic = nn.Parameter(torch.ones((1, channel_M, 1, 1)))
-        # self.y_q_scale = nn.Parameter(torch.ones((anchor_num, 1, 1, 1)))
-        # self.anchor_num = int(anchor_num)
-
-        # self._initialize_weights()
-
-    def multi_scale_feature_extractor(self, dpb):
-        if dpb["ref_feature"] is None:
-            feature = self.feature_adaptor_I(dpb["ref_frame"])
-        else:
-            feature = self.feature_adaptor_P(dpb["ref_feature"])
-        return self.feature_extractor(feature)
-
-    # def motion_compensation(self, dpb, mv):
-    #     warpframe = flow_warp(dpb["ref_frame"], mv)
-    #     mv2 = bilineardownsacling(mv) / 2
-    #     mv3 = bilineardownsacling(mv2) / 2
-    #     ref_feature1, ref_feature2, ref_feature3 = self.multi_scale_feature_extractor(dpb)
-    #     context1 = flow_warp(ref_feature1, mv)
-    #     context2 = flow_warp(ref_feature2, mv2)
-    #     context3 = flow_warp(ref_feature3, mv3)
-    #     context1, context2, context3 = self.context_fusion_net(context1, context2, context3)
-    #     return context1, context2, context3, warpframe
-
-    def forward(self, x, dpb):
-        ref_frame = dpb["ref_frame"]
-        est_mv = self.optic_flow(x, ref_frame)
-        mv_y = self.mv_encoder(est_mv)
-        mv_z = self.mv_hyper_prior_encoder(mv_y)
-        mv_z_hat, mv_z_likelihoods = self.bit_estimator_z_mv(mv_z)
-        mv_params = self.mv_hyper_prior_decoder(mv_z_hat)
-
-        ref_mv_y = dpb["ref_mv_y"]
-        if ref_mv_y is None:
-            ref_mv_y = torch.zeros_like(mv_y)
-        mv_params = torch.cat((mv_params, ref_mv_y), dim=1)
-        mv_scales, mv_means = self.mv_y_prior_fusion(mv_params).chunk(3, 1)
-
-
-        
-        mv_y_res, mv_y_q, mv_y_hat, mv_scales_hat = self.forward_dual_prior(
-            mv_y, mv_means, mv_scales, mv_q_step, self.mv_y_spatial_prior)
-
-        mv_hat = self.mv_decoder(mv_y_hat)
-        context1, context2, context3, warp_frame = self.motion_compensation(dpb, mv_hat)
-
-        y = self.contextual_encoder(x, context1, context2, context3)
-        z = self.contextual_hyper_prior_encoder(y)
-        z_hat = self.quant(z)
-        hierarchical_params = self.contextual_hyper_prior_decoder(z_hat)
-        temporal_params = self.temporal_prior_encoder(context3)
-
-        ref_y = dpb["ref_y"]
-        if ref_y is None:
-            ref_y = torch.zeros_like(y)
-        params = torch.cat((temporal_params, hierarchical_params, ref_y), dim=1)
-        q_step, scales, means = self.y_prior_fusion(params).chunk(3, 1)
-        y_res, y_q, y_hat, scales_hat = self.forward_dual_prior(
-            y, means, scales, q_step, self.y_spatial_prior)
-
-        recon_image_feature = self.contextual_decoder(y_hat, context2, context3)
-        feature, recon_image = self.recon_generation_net(recon_image_feature, context1)
-
-        B, _, H, W = x.size()
-        pixel_num = H * W
-        mse = self.mse(x, recon_image)
-        ssim = self.ssim(x, recon_image)
-        me_mse = self.mse(x, warp_frame)
-        mse = torch.sum(mse, dim=(1, 2, 3)) / pixel_num
-        me_mse = torch.sum(me_mse, dim=(1, 2, 3)) / pixel_num
-
-        if self.training:
-            y_for_bit = self.add_noise(y_res)
-            mv_y_for_bit = self.add_noise(mv_y_res)
-            z_for_bit = self.add_noise(z)
-            mv_z_for_bit = self.add_noise(mv_z)
-        else:
-            y_for_bit = y_q
-            mv_y_for_bit = mv_y_q
-            z_for_bit = z_hat
-            mv_z_for_bit = mv_z_hat
-        bits_y = self.get_y_laplace_bits(y_for_bit, scales_hat)
-        bits_mv_y = self.get_y_laplace_bits(mv_y_for_bit, mv_scales_hat)
-        bits_z = self.get_z_bits(z_for_bit, self.bit_estimator_z)
-        bits_mv_z = self.get_z_bits(mv_z_for_bit, self.bit_estimator_z_mv)
-
-        bpp_y = torch.sum(bits_y, dim=(1, 2, 3)) / pixel_num
-        bpp_z = torch.sum(bits_z, dim=(1, 2, 3)) / pixel_num
-        bpp_mv_y = torch.sum(bits_mv_y, dim=(1, 2, 3)) / pixel_num
-        bpp_mv_z = torch.sum(bits_mv_z, dim=(1, 2, 3)) / pixel_num
-
-        bpp = bpp_y + bpp_z + bpp_mv_y + bpp_mv_z
-        bit = torch.sum(bpp) * pixel_num
-        bit_y = torch.sum(bpp_y) * pixel_num
-        bit_z = torch.sum(bpp_z) * pixel_num
-        bit_mv_y = torch.sum(bpp_mv_y) * pixel_num
-        bit_mv_z = torch.sum(bpp_mv_z) * pixel_num
-
-        return {"bpp_mv_y": bpp_mv_y,
-                "bpp_mv_z": bpp_mv_z,
-                "bpp_y": bpp_y,
-                "bpp_z": bpp_z,
-                "bpp": bpp,
-                "me_mse": me_mse,
-                "mse": mse,
-                "ssim": ssim,
-                "dpb": {
-                    "ref_frame": recon_image,
-                    "ref_feature": feature,
-                    "ref_y": y_hat,
-                    "ref_mv_y": mv_y_hat,
-                },
-                "bit": bit,
-                "bit_y": bit_y,
-                "bit_z": bit_z,
-                "bit_mv_y": bit_mv_y,
-                "bit_mv_z": bit_mv_z,
-                }
+        return updated
