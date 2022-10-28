@@ -1,1 +1,1 @@
-# NeuralVideoCoding
+# Learned Video Compression
