@@ -1,1 +1,1 @@
-# Lossy VAE for Video Coding
+# Learned Video Codec
