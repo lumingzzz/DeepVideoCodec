@@ -75,6 +75,7 @@ class VideoFolder(Dataset):
         rnd_temp_order=False,
         transform=None,
         split="train",
+        max_frames=2,
     ):
         if transform is None:
             raise RuntimeError("Transform must be applied")
@@ -91,7 +92,7 @@ class VideoFolder(Dataset):
         with open(splitfile, "r") as f_in:
             self.sample_folders = [Path(f"{splitdir}/{f.strip()}") for f in f_in]
 
-        self.max_frames = 3  # hard coding for now
+        self.max_frames = max_frames  # hard coding for now
         self.rnd_interval = rnd_interval
         self.rnd_temp_order = rnd_temp_order
         self.transform = transform

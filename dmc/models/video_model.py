@@ -8,9 +8,10 @@ import torch.nn as nn
 from compressai.entropy_models import GaussianConditional
 
 from .base_model import CompressionModel, get_scale_table
-from .utils import quantize_ste, update_registered_buffers
-from ..layers import ME_Spynet, ResBlock, UNet, subpel_conv3x3, \
-    get_enc_dec_models, get_hyper_enc_dec_models, flow_warp, bilineardownsacling
+from .utils import quantize_ste, update_registered_buffers, Demultiplexer, Multiplexer
+from ..layers import ME_Spynet, ResBlock, UNet, conv1x1, subpel_conv3x3, \
+        get_enc_dec_models, get_hyper_enc_dec_models, flow_warp, bilineardownsacling, \
+        CheckerboardMaskedConv2d 
 
 
 class FeatureExtractor(nn.Module):
@@ -127,15 +128,36 @@ class ReconGeneration(nn.Module):
         return feature, recon
 
 
-class Hyperprior(CompressionModel):
+class DualSpatialPriorModel(CompressionModel):
     def __init__(self, planes: int = 64, latent_planes: int = 64):
         super().__init__(entropy_bottleneck_channels=latent_planes)
         self.hyper_encoder, self.hyper_decoder = \
             get_hyper_enc_dec_models(planes, latent_planes)
         self.gaussian_conditional = GaussianConditional(None)
+        
+        self.context_prediction = CheckerboardMaskedConv2d(
+            planes, 2 * planes, kernel_size=5, padding=2, stride=1
+        )
 
-    def forward(self, y):
+        self.y_mv_prior_fusion = nn.Sequential(
+            nn.Conv2d(planes * 3, planes * 3, 3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Conv2d(planes * 3, planes * 3, 3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Conv2d(planes * 3, planes * 2, 3, stride=1, padding=1)
+        )
+        
+        self.entropy_parameters = nn.Sequential(
+                conv1x1(planes*12//3, planes*10//3, 1),
+                nn.GELU(),
+                conv1x1(planes*10//3, planes*8//3, 1),
+                nn.GELU(),
+                conv1x1(planes*8//3, planes*6//3, 1),
+        ) 
+
+    def forward(self, y, y_ref):
         z = self.hyper_encoder(y)
+        # z_hat, z_likelihoods = self.entropy_bottleneck(z)
         _, z_likelihoods = self.entropy_bottleneck(z)
 
         z_offset = self.entropy_bottleneck._get_medians()
@@ -143,37 +165,124 @@ class Hyperprior(CompressionModel):
         z_hat = quantize_ste(z_tmp) + z_offset
 
         params = self.hyper_decoder(z_hat)
-        scales, means = params.chunk(2, 1)
-        _, y_likelihoods = self.gaussian_conditional(y, scales, means)
-        y_hat = quantize_ste(y - means) + means
+        if y_ref is None:
+            y_ref = torch.zeros_like(y)
+        params = self.y_mv_prior_fusion(torch.cat((params, y_ref), dim=1))
+
+        # y_hat = self.gaussian_conditional.quantize(
+        #     y, "noise" if self.training else "dequantize"
+        # )
+        
+        ctx_params = torch.zeros_like(params)
+        gaussian_params = self.entropy_parameters(
+            torch.cat((params, ctx_params), dim=1)
+        )
+        scales_hat, means_hat = gaussian_params.chunk(2, 1)
+        y_hat = quantize_ste(y - means_hat) + means_hat
+        
+        # set non_anchor to 0
+        y_half = y_hat.clone()
+        y_half[:, :, 0::2, 0::2] = 0
+        y_half[:, :, 1::2, 1::2] = 0
+
+        # set anchor's ctx to 0, otherwise there will be a bias
+        ctx_params = self.context_prediction(y_half)
+        ctx_params[:, :, 0::2, 1::2] = 0
+        ctx_params[:, :, 1::2, 0::2] = 0
+
+        gaussian_params = self.entropy_parameters(
+            torch.cat((params, ctx_params), dim=1)
+        )
+        scales_hat, means_hat = gaussian_params.chunk(2, 1)
+        
+        _, y_likelihoods = self.gaussian_conditional(y, scales_hat, means_hat)
+        y_hat = quantize_ste(y - means_hat) + means_hat
         return y_hat, {"y": y_likelihoods, "z": z_likelihoods}
 
-    def compress(self, y):
+    def compress(self, y, y_ref):
         z = self.hyper_encoder(y)
 
-        z_string = self.entropy_bottleneck.compress(z)
-        z_hat = self.entropy_bottleneck.decompress(z_string, z.size()[-2:])
-
+        z_strings = self.entropy_bottleneck.compress(z)
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
+        
         params = self.hyper_decoder(z_hat)
-        scales, means = params.chunk(2, 1)
-
-        indexes = self.gaussian_conditional.build_indexes(scales)
-        y_string = self.gaussian_conditional.compress(y, indexes, means)
-        y_hat = self.gaussian_conditional.quantize(y, "dequantize", means)
-
-        return y_hat, {"strings": [y_string, z_string], "shape": z.size()[-2:]}
-
-    def decompress(self, strings, shape):
-        assert isinstance(strings, list) and len(strings) == 2
-        z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
-
-        params = self.hyper_decoder(z_hat)
-        scales, means = params.chunk(2, 1)
-
-        indexes = self.gaussian_conditional.build_indexes(scales)
-        y_hat = self.gaussian_conditional.decompress(
-            strings[0], indexes, z_hat.dtype, means
+        
+        if y_ref is None:
+            y_ref = torch.zeros_like(y)
+        params = self.y_mv_prior_fusion(torch.cat((params, y_ref), dim=1))
+        
+        ctx_params = torch.zeros_like(params)
+        gaussian_params = self.entropy_parameters(
+            torch.cat((params, ctx_params), dim=1)
         )
+        _, means_hat = gaussian_params.chunk(2, 1)
+        y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat)
+        
+        # set non_anchor to 0
+        y_half = y_hat.clone()
+        y_half[:, :, 0::2, 0::2] = 0
+        y_half[:, :, 1::2, 1::2] = 0
+
+        # set anchor's ctx to 0, otherwise there will be a bias
+        ctx_params = self.context_prediction(y_half)
+        ctx_params[:, :, 0::2, 1::2] = 0
+        ctx_params[:, :, 1::2, 0::2] = 0
+
+        gaussian_params = self.entropy_parameters(
+            torch.cat((params, ctx_params), dim=1)
+        )
+        scales_hat, means_hat = gaussian_params.chunk(2, 1)
+        y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat)
+        
+        y_anchor, y_non_anchor = Demultiplexer(y)
+        scales_hat_anchor, scales_hat_non_anchor = Demultiplexer(scales_hat)
+        means_hat_anchor, means_hat_non_anchor = Demultiplexer(means_hat)
+
+        indexes_anchor = self.gaussian_conditional.build_indexes(scales_hat_anchor)
+        indexes_non_anchor = self.gaussian_conditional.build_indexes(scales_hat_non_anchor)
+
+        anchor_strings = self.gaussian_conditional.compress(y_anchor, indexes_anchor, means=means_hat_anchor)
+        non_anchor_strings = self.gaussian_conditional.compress(y_non_anchor, indexes_non_anchor, means=means_hat_non_anchor)
+
+        return y_hat, {"strings": [anchor_strings, non_anchor_strings, z_strings], "shape": z.size()[-2:]}
+
+    def decompress(self, strings, shape, y_ref):
+        assert isinstance(strings, list) and len(strings) == 3
+        z_hat = self.entropy_bottleneck.decompress(strings[2], shape)
+        N, _, H, W = z_hat.shape
+        params = self.hyper_decoder(z_hat)
+        
+        if y_ref is None:
+            y_ref = torch.zeros([N, params.size(1)//2, H * 4, W * 4]).to(z_hat.device)
+        params = self.y_mv_prior_fusion(torch.cat((params, y_ref), dim=1))
+        
+        ctx_params = torch.zeros_like(params)
+        gaussian_params = self.entropy_parameters(
+            torch.cat((params, ctx_params), dim=1)
+        )
+        scales_hat, means_hat = gaussian_params.chunk(2, 1)
+        scales_hat_anchor, _ = Demultiplexer(scales_hat)
+        means_hat_anchor, _ = Demultiplexer(means_hat)
+        
+        indexes_anchor = self.gaussian_conditional.build_indexes(scales_hat_anchor)
+        y_anchor = self.gaussian_conditional.decompress(strings[0], indexes_anchor, means=means_hat_anchor)     # [1, 384, 8, 8]
+        y_anchor = Multiplexer(y_anchor, torch.zeros_like(y_anchor))    # [1, 192, 16, 16]
+        
+        ctx_params = self.context_prediction(y_anchor)
+        gaussian_params = self.entropy_parameters(
+            torch.cat((params, ctx_params), dim=1)
+        )
+
+        scales_hat, means_hat = gaussian_params.chunk(2, 1)
+        _, scales_hat_non_anchor = Demultiplexer(scales_hat)
+        _, means_hat_non_anchor = Demultiplexer(means_hat)
+        
+        indexes_non_anchor = self.gaussian_conditional.build_indexes(scales_hat_non_anchor)
+        y_non_anchor = self.gaussian_conditional.decompress(strings[1], indexes_non_anchor, means=means_hat_non_anchor)  # [1, 384, 8, 8]
+        y_non_anchor = Multiplexer(torch.zeros_like(y_non_anchor), y_non_anchor)    # [1, 192, 16, 16]
+        
+        # gather
+        y_hat = y_anchor + y_non_anchor
 
         return y_hat
 
@@ -193,7 +302,7 @@ class DMC(nn.Module):
         self.optic_flow = ME_Spynet()
 
         self.mv_encoder, self.mv_decoder = get_enc_dec_models(2, 2, channel_mv)
-        self.mv_hyperprior = Hyperprior(planes=channel_mv, latent_planes=channel_N)
+        self.mv_context_model = DualSpatialPriorModel(planes=channel_mv, latent_planes=channel_N)
 
         self.feature_adaptor_I = nn.Conv2d(3, channel_N, 3, stride=1, padding=1)
         self.feature_adaptor_P = nn.Conv2d(channel_N, channel_N, 1)
@@ -202,7 +311,7 @@ class DMC(nn.Module):
 
         self.contextual_encoder = ContextualEncoder(channel_N=channel_N, channel_M=channel_M)
         self.contextual_decoder = ContextualDecoder(channel_N=channel_N, channel_M=channel_M)
-        self.ctx_hyperprior = Hyperprior(planes=channel_M, latent_planes=channel_N)
+        self.ctx_context_model = DualSpatialPriorModel(planes=channel_M, latent_planes=channel_N)
         self.recon_generation_net = ReconGeneration()
 
         self._initialize_weights()
@@ -214,7 +323,7 @@ class DMC(nn.Module):
             feature = self.feature_adaptor_P(dpb["feature_ref"])
         return self.feature_extractor(feature)
 
-    def motion_compensation(self, dpb, mv):
+    def motion_compensation(self, mv, dpb):
         warpframe = flow_warp(dpb["x_ref"], mv)
         mv2 = bilineardownsacling(mv) / 2
         mv3 = bilineardownsacling(mv2) / 2
@@ -252,17 +361,17 @@ class DMC(nn.Module):
 
         for i in range(1, len(frames)):
             x = frames[i]
-            # x_ref, likelihoods = self.forward_inter(x, dpb)
             x_rec, likelihoods, info = self.forward_inter(x, dpb)
             reconstructions.append(x_rec)
             frames_likelihoods.append(likelihoods)
             
-            dpb = {
-                    "x_ref": x_rec,
-                    "feature_ref": info["feature_ref"],
-                    "y_ref": info["y_ref"],
-                    "y_ref_mv": info["y_ref_motion"],
-                }
+            if len(frames) >= 3:
+                dpb = {
+                        "x_ref": x_rec,
+                        "feature_ref": info["feature_ref"],
+                        "y_ref": info["y_ref"],
+                        "y_ref_mv": info["y_ref_mv"],
+                    }
 
         return {
             "x_hat": reconstructions,
@@ -274,36 +383,33 @@ class DMC(nn.Module):
 
         motion = self.optic_flow(x_cur, x_ref)
         y_motion = self.mv_encoder(motion)
-        y_motion_hat, motion_likelihoods = self.mv_hyperprior(y_motion)
+        y_motion_hat, motion_likelihoods = self.mv_context_model(y_motion, dpb["y_ref_mv"])
         
         x_motion_hat = self.mv_decoder(y_motion_hat)
-        context1, context2, context3, x_warp = self.motion_compensation(dpb, x_motion_hat)
+        context1, context2, context3, x_warp = self.motion_compensation(x_motion_hat, dpb)
         
-        y = self.contextual_encoder(x_cur, context1, context2, context3)
-        y_hat, ctx_likelihoods = self.ctx_hyperprior(y)
+        # y = self.contextual_encoder(x_cur, context1, context2, context3)
+        # y_hat, ctx_likelihoods = self.ctx_context_model(y, dpb["y_ref"])
 
-        x_rec_feature = self.contextual_decoder(y_hat, context2, context3)
-        feature, x_rec = self.recon_generation_net(x_rec_feature, context1)
+        # x_rec_feature = self.contextual_decoder(y_hat, context2, context3)
+        # feature, x_rec = self.recon_generation_net(x_rec_feature, context1)
 
-        # return x_warp, {"motion": motion_likelihoods}
+        return x_warp, {"motion": motion_likelihoods}, {}
         # return x_rec, {"motion": motion_likelihoods, "context": ctx_likelihoods}
-        return x_rec, {"motion": motion_likelihoods, "context": ctx_likelihoods}, {"x_ref": x_rec, "feature_ref": feature, "y_ref": y_hat, "y_ref_motion": y_motion_hat}
+        # return x_rec, {"motion": motion_likelihoods, "context": ctx_likelihoods}, {"x_ref": x_rec, "feature_ref": feature, "y_ref": y_hat, "y_ref_mv": y_motion_hat}
         
     def encode_inter(self, x_cur, dpb):
         x_ref = dpb["x_ref"]
         
         motion = self.optic_flow(x_cur, x_ref)
         y_motion = self.mv_encoder(motion)
-        y_motion_hat, out_motion = self.mv_hyperprior.compress(y_motion)
+        y_motion_hat, out_motion = self.mv_context_model.compress(y_motion, dpb["y_ref_mv"])
 
         x_motion_hat = self.mv_decoder(y_motion_hat)
-        context1, context2, context3, x_warp = self.motion_compensation(dpb, x_motion_hat)
+        context1, context2, context3, x_warp = self.motion_compensation(x_motion_hat, dpb)
         
         y = self.contextual_encoder(x_cur, context1, context2, context3)
-        y_hat, out_y = self.ctx_hyperprior.compress(y)
-        
-        # x_rec_feature = self.contextual_decoder(y_hat, context2, context3)
-        # feature, x_rec = self.recon_generation_net(x_rec_feature, context1)
+        y_hat, out_y = self.ctx_context_model.compress(y, dpb["y_ref"])
 
         return {
             "strings": {
@@ -315,14 +421,14 @@ class DMC(nn.Module):
 
     def decode_inter(self, x_ref, strings, shapes, dpb):
         key = "motion"
-        y_motion_hat = self.mv_hyperprior.decompress(strings[key], shapes[key])
+        y_motion_hat = self.mv_context_model.decompress(strings[key], shapes[key], dpb["y_ref_mv"])
 
         x_motion_hat = self.mv_decoder(y_motion_hat)
-        context1, context2, context3, x_warp = self.motion_compensation(dpb, x_motion_hat)
+        context1, context2, context3, x_warp = self.motion_compensation(x_motion_hat, dpb)
 
         # context
         key = "context"
-        y_hat = self.ctx_hyperprior.decompress(strings[key], shapes[key])
+        y_hat = self.ctx_context_model.decompress(strings[key], shapes[key], dpb["y_ref"])
         
         x_rec_feature = self.contextual_decoder(y_hat, context2, context3)
         feature, x_rec = self.recon_generation_net(x_rec_feature, context1)
@@ -388,28 +494,28 @@ class DMC(nn.Module):
 
         # Dynamically update the entropy bottleneck buffers related to the CDFs
         update_registered_buffers(
-            self.mv_hyperprior.gaussian_conditional,
-            "mv_hyperprior.gaussian_conditional",
+            self.mv_context_model.gaussian_conditional,
+            "mv_context_model.gaussian_conditional",
             ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
             state_dict,
         )
         
         update_registered_buffers(
-            self.mv_hyperprior.entropy_bottleneck,
-            "mv_hyperprior.entropy_bottleneck",
+            self.mv_context_model.entropy_bottleneck,
+            "mv_context_model.entropy_bottleneck",
             ["_quantized_cdf", "_offset", "_cdf_length"],
             state_dict,
         )
 
         update_registered_buffers(
-            self.ctx_hyperprior.gaussian_conditional,
-            "ctx_hyperprior.gaussian_conditional",
+            self.ctx_context_model.gaussian_conditional,
+            "ctx_context_model.gaussian_conditional",
             ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
             state_dict,
         )
         update_registered_buffers(
-            self.ctx_hyperprior.entropy_bottleneck,
-            "ctx_hyperprior.entropy_bottleneck",
+            self.ctx_context_model.entropy_bottleneck,
+            "ctx_context_model.entropy_bottleneck",
             ["_quantized_cdf", "_offset", "_cdf_length"],
             state_dict,
         )
@@ -427,14 +533,14 @@ class DMC(nn.Module):
         if scale_table is None:
             scale_table = get_scale_table()
 
-        updated = self.mv_hyperprior.gaussian_conditional.update_scale_table(
+        updated = self.mv_context_model.gaussian_conditional.update_scale_table(
             scale_table, force=force
         )
-        updated |= self.mv_hyperprior.entropy_bottleneck.update(force=force)
+        updated |= self.mv_context_model.entropy_bottleneck.update(force=force)
 
-        updated |= self.ctx_hyperprior.gaussian_conditional.update_scale_table(
+        updated |= self.ctx_context_model.gaussian_conditional.update_scale_table(
             scale_table, force=force
         )
-        updated |= self.ctx_hyperprior.entropy_bottleneck.update(force=force)
+        updated |= self.ctx_context_model.entropy_bottleneck.update(force=force)
 
         return updated

@@ -40,7 +40,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import List
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 import torch
 import torch.nn as nn
@@ -49,10 +49,10 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from compressai.zoo import cheng2020_anchor
-from compressai.models.tinylic import TinyLIC
+# from compressai.models.tinylic import TinyLIC
 
 from datasets import VideoFolder
-from dmc.models import DMC_v2
+from dmc.models import DMC
 
 
 def setup_logger(log_dir):
@@ -100,7 +100,7 @@ class RateDistortionLoss(nn.Module):
         super().__init__()
         self.mse = nn.MSELoss(reduction="none")
         self.lmbda = lmbda
-        self._scaling_functions = lambda x: (2**bitdepth - 1) ** 2 * x
+        # self._scaling_functions = lambda x: (2**bitdepth - 1) ** 2 * x
         self.return_details = bool(return_details)
 
     @staticmethod
@@ -138,9 +138,9 @@ class RateDistortionLoss(nn.Module):
 
         # sum value over the components dimension
         metric_value = torch.sum(metric_values.transpose(1, 0), dim=1) / nC
-        scaled_metric = self._scaling_functions(metric_value)
+        # scaled_metric = self._scaling_functions(metric_value)
 
-        return scaled_metric, metric_value
+        return metric_value
 
     @staticmethod
     def _check_tensor(x) -> bool:
@@ -172,21 +172,22 @@ class RateDistortionLoss(nn.Module):
         num_pixels = H * W * num_frames
 
         # Get scaled and raw loss distortions for each frame
-        scaled_distortions = []
+        # scaled_distortions = []
         distortions = []
         for i, (x_hat, x) in enumerate(zip(output["x_hat"], target)):
-            scaled_distortion, distortion = self._get_scaled_distortion(x_hat, x)
+            distortion = self._get_scaled_distortion(x_hat, x)
 
             distortions.append(distortion)
-            scaled_distortions.append(scaled_distortion)
+            # scaled_distortions.append(scaled_distortion)
 
             if self.return_details:
                 out[f"frame{i}.mse_loss"] = distortion
         # aggregate (over batch and frame dimensions).
         out["mse_loss"] = torch.stack(distortions).mean()
 
-        # average scaled_distortions accros the frames
-        scaled_distortions = sum(scaled_distortions) / num_frames
+        # # average scaled_distortions accros the frames
+        # scaled_distortions = sum(scaled_distortions) / num_frames
+        distortions = sum(distortions) / num_frames
 
         assert isinstance(output["likelihoods"], list)
         likelihoods_list = output.pop("likelihoods")
@@ -201,9 +202,11 @@ class RateDistortionLoss(nn.Module):
         lambdas = torch.full_like(bpp_loss, self.lmbda)
 
         bpp_loss = bpp_loss.mean()
-        out["loss"] = (lambdas * scaled_distortions).mean() + bpp_loss
+        # out["loss"] = (lambdas * scaled_distortions).mean() + bpp_loss
+        out["loss"] = (lambdas * distortions).mean() + bpp_loss
 
-        out["distortion"] = scaled_distortions.mean()
+        # out["distortion"] = scaled_distortions.mean()
+        out["distortion"] = distortions.mean()
         out["bpp_loss"] = bpp_loss
         return out
 
@@ -289,10 +292,9 @@ def train_one_epoch(
         out_net = net_inter(d)
         # out_net["likelihoods"].append(frame_i_out["likelihoods"])
 
-        # out_criterion = criterion(out_net, [d[1]])
-        out_criterion = criterion(out_net, [d[1], d[2]])
-        # out_criterion["mse_loss"].backward()
-        out_criterion["loss"].backward()
+        out_criterion = criterion(out_net, d[1:])
+        out_criterion["mse_loss"].backward()
+        # out_criterion["loss"].backward()
         if clip_max_norm > 0:
             torch.nn.utils.clip_grad_norm_(net_inter.parameters(), clip_max_norm)
         optimizer.step()
@@ -327,8 +329,7 @@ def test_epoch(epoch, test_dataloader, net_intra, net_inter, criterion):
             d[0] = frame_i_out["x_hat"]
             
             out_net = net_inter(d)
-            # out_criterion = criterion(out_net, [d[1]])
-            out_criterion = criterion(out_net, [d[1], d[2]])
+            out_criterion = criterion(out_net, d[1:])
 
             aux_loss.update(compute_aux_loss(net_inter.aux_loss()))
             loss.update(out_criterion["loss"])
@@ -408,6 +409,12 @@ def parse_args(argv):
         help="Test batch size (default: %(default)s)",
     )
     parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=2,
+        help="Max frames (default: %(default)s)",
+    )
+    parser.add_argument(
         "--aux-learning-rate",
         default=1e-3,
         help="Auxiliary loss learning rate (default: %(default)s)",
@@ -475,6 +482,7 @@ def main(argv):
         rnd_temp_order=True,
         split="train",
         transform=train_transforms,
+        max_frames=args.max_frames,
     )
     test_dataset = VideoFolder(
         args.dataset,
@@ -482,6 +490,7 @@ def main(argv):
         rnd_temp_order=False,
         split="test",
         transform=test_transforms,
+        max_frames=args.max_frames,
     )
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
@@ -502,18 +511,18 @@ def main(argv):
         pin_memory=(device == "cuda"),
     )
 
-    # net_intra = cheng2020_anchor(quality=args.quality_level, pretrained=True)
-    net_intra = TinyLIC()
-    snapshot = torch.load('/workspace/lm/TinyLIC-Re/example/checkpoint_q'+str(args.quality_level)+'.pth.tar',
-                        map_location=device)
-    net_intra.load_state_dict(snapshot, strict=True)
+    net_intra = cheng2020_anchor(quality=args.quality_level, pretrained=True)
+    # net_intra = TinyLIC()
+    # snapshot = torch.load('/workspace/lm/TinyLIC-Re/example/checkpoint_q'+str(args.quality_level)+'.pth.tar',
+    #                     map_location=device)
+    # net_intra.load_state_dict(snapshot, strict=True)
 
     for param in net_intra.parameters():
         param.requires_grad = False
     net_intra = net_intra.to(device)
     net_intra.eval()
 
-    net_inter = DMC_v2()
+    net_inter = DMC()
     net_inter = net_inter.to(device)
 
     optimizer, aux_optimizer = configure_optimizers(net_inter, args)
