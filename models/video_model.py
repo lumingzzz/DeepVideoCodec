@@ -1,22 +1,20 @@
 import math
 import logging
-import pickle
 from pathlib import Path
-from PIL import Image
 from collections import OrderedDict, defaultdict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as tnf
-from torch.hub import load_state_dict_from_url
-import torchvision.transforms.functional as tvf
 
 from timm.models.layers.mlp import Mlp
 from timm.utils import AverageMeter
 
-from .layers import patch_downsample, patch_upsample, conv_k1s1, conv_k3s1
+from .layers import patch_downsample, patch_upsample, conv_k1s1, conv_k3s1, ME_Spynet
 from .entropy_coding import DiscretizedGaussian, gaussian_log_prob_mass
 from .utils import crop_divisible_by, pad_divisible_by
+
+from .image_model import qres_vr
 
 
 MAX_LMB = 8192
@@ -127,7 +125,7 @@ class VRLatentBlock3Pos(nn.Module):
         """
         feature = self.resnet_front(feature, lmb_embedding)
         pm, plogv = self.prior(feature).chunk(2, dim=1)
-        plogv = tnf.softplus(plogv + 2.3) - 2.3 # make logscale > -2.3
+        plogv = F.softplus(plogv + 2.3) - 2.3 # make logscale > -2.3
         pv = torch.exp(plogv)
         return feature, pm, pv
 
@@ -219,16 +217,19 @@ class FeatureExtractor(nn.Module):
         return enc_features
 
 
-class VariableRateLossyVAE(nn.Module):
+class MyInterModel(nn.Module):
     log2_e = math.log2(math.e)
 
     def __init__(self, config: dict):
         super().__init__()
+
+        self.optic_flow = ME_Spynet()
+
         # feature extractor (bottom-up path)
-        self.encoder = FeatureExtractor(config.pop('enc_blocks'))
+        self.mv_encoder = FeatureExtractor(config.pop('mv_enc_blocks'))
         # latent variable blocks (top-down path)
-        self.dec_blocks = nn.ModuleList(config.pop('dec_blocks'))
-        width = self.dec_blocks[0].in_channels
+        self.mv_dec_blocks = nn.ModuleList(config.pop('mv_dec_blocks'))
+        width = self.mv_dec_blocks[0].in_channels
         self.bias = nn.Parameter(torch.zeros(1, width, 1, 1))
         self.num_latents = len([b for b in self.dec_blocks if getattr(b, 'is_latent_block', False)])
         # loss function, for computing reconstruction loss
@@ -243,24 +244,63 @@ class VariableRateLossyVAE(nn.Module):
         self._dummy: torch.Tensor
 
         self.compressing = False
-        # self._stats_log = dict()
         self._logging_images = config.get('log_images', None)
         self._logging_smpl_k = [1, 2]
         self._flops_mode = False
 
-    def _set_lmb_embedding(self, config):
-        assert len(config['log_lmb_range']) == 2
-        self.log_lmb_range = (float(config['log_lmb_range'][0]), float(config['log_lmb_range'][1]))
-        self.lmb_embed_dim = config['lmb_embed_dim']
-        self.lmb_embedding = nn.Sequential(
-            nn.Linear(self.lmb_embed_dim[0], self.lmb_embed_dim[1]),
-            nn.GELU(),
-            nn.Linear(self.lmb_embed_dim[1], self.lmb_embed_dim[1]),
-        )
-        self._default_log_lmb = (self.log_lmb_range[0] + self.log_lmb_range[1]) / 2
-        # experiment
-        self._sin_period = config['sin_period']
-        self.LOG_LMB_SCALE = self._sin_period / math.log(MAX_LMB)
+        # im_channels = 3
+        # # ================================ feature extractor ================================
+        # ch = 96
+        # enc_dims = (32, 64, ch*1, ch*2, ch*4, ch*4, ch*4)
+        # enc_nums     = (1, 2, 2, 2, 2, 2, 2)
+        # kernel_sizes = (7, 7, 7, 7, 7, 5, 3)
+        # enc_blocks = [common.conv_k3s1(im_channels, 32),]
+        # for i, (dim, ks, num) in enumerate(zip(enc_dims, kernel_sizes, enc_nums,)):
+        #     for _ in range(num):
+        #         enc_blocks.append(common.MyConvNeXtBlock(dim, kernel_size=ks))
+        #     if i < len(enc_dims) - 1:
+        #         new_dim = enc_dims[i+1]
+        #         # enc_blocks.append(common.MyConvNeXtPatchDown(dim, new_dim, kernel_size=ks))
+        #         enc_blocks.append(myconvnext_down(dim, new_dim, kernel_size=ks))
+        # self.feature_extractor = common.BottomUpEncoder(enc_blocks, dict_key='stride')
+
+        # self.strides_that_have_bits = set([4, 8, 16, 32, 64])
+        # # ================================ flow models ================================
+        # global_strides = (1, 2, 4, 8, 16, 32, 64)
+        # flow_dims = (None, None, 48, 72, 96, 128, 128)
+        # flow_zdims = (None, None, 2, 4, 4, 4, 4)
+        # kernel_sizes = (7, 7, 7, 7, 7, 5, 3)
+        # self.flow_blocks = nn.ModuleDict()
+        # for s, indim, dim, zdim, ks in zip(global_strides, enc_dims, flow_dims, flow_zdims, kernel_sizes):
+        #     if s not in self.strides_that_have_bits:
+        #         continue
+        #     corr_dim, strided = (96, True) if (s == 4) else (128, False)
+        #     module = qrvm.CorrelationFlowCodingBlock(indim, dim=dim, zdim=zdim, ks=ks,
+        #                     corr_dim=corr_dim, strided_corr=strided)
+        #     self.flow_blocks[f'stride{s}'] = module
+        # # ================================ p-frame models ================================
+        # dec_dims = enc_dims
+        # self.bias = nn.Parameter(torch.zeros(1, dec_dims[-1], 1, 1))
+        # self.dec_blocks = nn.ModuleDict()
+        # for s, dim, ks in zip(global_strides, dec_dims, kernel_sizes):
+        #     if s in self.strides_that_have_bits:
+        #         module = qrvm.SpyCodingFrameBlock(dim, zdim=8, kernel_size=ks)
+        #     else:
+        #         module = qrvm.ResConditional(dim, kernel_size=ks)
+        #     self.dec_blocks[f'stride{s}'] = module
+        # # ================================ upsample layers ================================
+        # self.upsamples = nn.ModuleDict()
+        # for i, (s, dim) in enumerate(zip(global_strides, dec_dims)):
+        #     if s == 1: # same as image resolution; no need to upsample
+        #         conv = common.conv_k3s1(dim, im_channels)
+        #     else:
+        #         conv = common.patch_upsample(dim, dec_dims[i-1], rate=2)
+        #     self.upsamples[f'stride{s}'] = conv
+
+        # self.global_strides = global_strides
+        # self.max_stride = max(global_strides)
+
+        # self.distortion_lmb = float(distortion_lmb)
 
     def sample_log_lmb(self, n):
         low, high = self.log_lmb_range
@@ -290,230 +330,156 @@ class VariableRateLossyVAE(nn.Module):
     def get_bias(self, bhw_repeat=(1,1,1)):
         nB, nH, nW = bhw_repeat
         feature = self.bias.expand(nB, -1, nH, nW)
-        # feature = torch.zeros(nB, self.initial_width, nH, nW, device=self._dummy.device)
         return feature
 
-    def forward_end2end(self, im: torch.Tensor, log_lmb: torch.Tensor, get_latents=False):
+    def forward_end2end(self, x_cur: torch.Tensor, dpb, log_lmb: torch.Tensor, get_latents=False):
         # ================ get lambda embedding ================
-        emb = self._get_lmb_embedding(log_lmb, n=im.shape[0])
-        # ================ Forward pass ================
-        enc_features = self.encoder(im, emb)
-        all_block_stats = []
-        nB, _, nH, nW = enc_features[min(enc_features.keys())].shape
-        feature = self.get_bias(bhw_repeat=(nB, nH, nW))
-        for i, block in enumerate(self.dec_blocks):
+        emb = self._get_lmb_embedding(log_lmb, n=x_cur.shape[0])
+        
+        x_ref = dpb["x_ref"]
+        mv = self.optic_flow(x_cur, x_ref)
+        enc_mv_features = self.mv_encoder(mv, emb)
+        mv_block_stats = []
+        nB, _, nH, nW = enc_mv_features[min(enc_mv_features.keys())].shape
+        mv_feature = self.get_bias(bhw_repeat=(nB, nH, nW))
+        for i, block in enumerate(self.mv_dec_blocks):
             if getattr(block, 'is_latent_block', False):
-                key = int(feature.shape[2])
-                f_enc = enc_features[key]
-                feature, stats = block(feature, emb, enc_feature=f_enc, mode='trainval',
+                key = int(mv_feature.shape[2])
+                f_enc = enc_mv_features[key]
+                mv_feature, stats = block(mv_feature, emb, enc_feature=f_enc, mode='trainval',
                                        log_lmb=log_lmb, get_latent=get_latents)
-                all_block_stats.append(stats)
+                mv_block_stats.append(stats)
             elif getattr(block, 'requires_embedding', False):
-                feature = block(feature, emb)
+                mv_feature = block(mv_feature, emb)
             else:
-                feature = block(feature)
-        return feature, all_block_stats
+                mv_feature = block(mv_feature)
 
-    def forward(self, batch, log_lmb=None, return_rec=False):
-        if isinstance(batch, (tuple, list)):
-            im, label = batch
-        else:
-            im = batch
-        im = im.to(self._dummy.device)
-        nB, imC, imH, imW = im.shape # batch, channel, height, width
+        print(mv_feature.shape)
 
+        return mv_feature, mv_block_stats
+
+
+
+    def forward(self, im, im_prev):
         # ================ Forward pass ================
-        if (log_lmb is None): # training
-            log_lmb = self.sample_log_lmb(n=im.shape[0])
-        assert isinstance(log_lmb, torch.Tensor) and log_lmb.shape == (nB,)
-        x_hat, stats_all = self.forward_end2end(im, log_lmb)
+        flow_stats, frame_stats, x_hat, flow_hat = self.forward_end2end(im, im_prev)
 
-        # ================ Compute Loss ================
-        # rate
-        kl_divergences = [stat['kl'].sum(dim=(1, 2, 3)) for stat in stats_all]
-        ndims = float(imC * imH * imW)
-        kl = sum(kl_divergences) / ndims # nats per dimension
-        # distortion
-        distortion = self.distortion_func(x_hat, im)
-        # rate + distortion
-        loss = kl + torch.exp(log_lmb) * distortion
-        loss = loss.mean(0)
+        # ================ Compute loss ================
+        num_pix = float(im.shape[2] * im.shape[3])
+        # Rate
+        flow_kls  = [stat['kl'] for stat in flow_stats  if ('kl' in stat)]
+        frame_kls = [stat['kl'] for stat in frame_stats if ('kl' in stat)]
+        # from total nats to bits-per-pixel
+        flow_bpp  = self.log2_e * sum([kl.sum(dim=(1,2,3)) for kl in flow_kls]).mean(0) / num_pix
+        frame_bpp = self.log2_e * sum([kl.sum(dim=(1,2,3)) for kl in frame_kls]).mean(0) / num_pix
+        # Distortion
+        mse = tnf.mse_loss(x_hat, im, reduction='mean')
+        # Rate + lmb * Distortion
+        loss = (flow_bpp + frame_bpp) + self.distortion_lmb * mse
 
         stats = OrderedDict()
         stats['loss'] = loss
-
         # ================ Logging ================
         with torch.no_grad():
-            # for training print
-            stats['bppix'] = kl.mean(0).item() * self.log2_e * imC
-            stats[self.distortion_name] = distortion.mean(0).item()
-            im_hat = x_hat.detach()
-            im_mse = tnf.mse_loss(im_hat, im, reduction='mean')
-            psnr = -10 * math.log10(im_mse.item())
-            stats['psnr'] = psnr
+            stats['bpp'] = (flow_bpp + frame_bpp).item()
+            stats['psnr'] = -10 * math.log10(mse.item())
+            stats['mv-bpp'] = flow_bpp.item()
+            stats['fr-bpp'] = frame_bpp.item()
+            warp_mse = tnf.mse_loss(bilinear_warp(im_prev, flow_hat), im)
+            stats['warp-psnr'] = -10 * math.log10(warp_mse.item())
 
-        if return_rec:
-            stats['im_hat'] = im_hat
+        context = {'x_hat': x_hat}
+        return stats, context
+
+
+class LossyVideoCodec(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # ================================ i-frame model ================================
+        self.i_model = qres_vr()
+        # # fix i-model parameters
+        for p in self.i_model.parameters():
+            p.requires_grad_(False)
+        # load pre-trained parameters
+        wpath = f'checkpoints/qres-vr/checkpoint_best_loss.pth.tar'
+        self.i_model.load_state_dict(torch.load(wpath)['state_dict'])
+
+        # ================================ p-frame model ================================
+        self.p_model = MyInterModel()
+
+        # self.testing_gop = 32 # group of pictures at test-time
+        self.register_buffer('_dummy', torch.zeros(1), persistent=False)
+        self._dummy: torch.Tensor
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.i_model.eval() # the i-frame model is always in eval mode
+        return self
+
+    def forward(self, frames):
+        assert isinstance(frames, list)
+        assert all([(im.shape == frames[0].shape) for im in frames])
+        frames = [f.to(device=self._dummy.device) for f in frames]
+
+        # initialize statistics for training and logging
+        stats = OrderedDict()
+        stats['loss'] = 0.0
+        stats['bpp']  = None
+        stats['psnr'] = None
+
+        # ---------------- i-frame ----------------
+        # assert not self.i_model.training
+        # with torch.no_grad():
+        #     _stats_i = self.i_model(frames[0], return_rec=True)
+        #     prev_frame = _stats_i['im_hat']
+        #     # logging
+        #     stats['i-bpp']  = _stats_i['bppix']
+        #     stats['i-psnr'] = _stats_i['psnr']
+        stats['i-bpp'] = 0
+        stats['i-psnr'] = 0
+
+        # ---------------- p-frames ----------------
+        p_stats_keys = ['loss', 'mv-bpp', 'warp-psnr', 'p-bpp', 'p-psnr']
+        for key in p_stats_keys:
+            stats[key] = 0.0
+        p_frames = frames[1:]
+        for i, frame in enumerate(p_frames):
+            # conditional coding of current frame
+            _stats_p, context_p = self.p_model(frame, prev_frame)
+
+            # logging
+            stats['loss'] = stats['loss'] + _stats_p['loss']
+            stats['mv-bpp']    += float(_stats_p['mv-bpp'])
+            stats['warp-psnr'] += float(_stats_p['warp-psnr'])
+            stats['p-bpp']     += float(_stats_p['fr-bpp'])
+            stats['p-psnr']    += float(_stats_p['psnr'])
+            # if (log_dir is not None): # save results
+            #     log_dir = Path(log_dir)
+            #     save_images(log_dir, f'prev_xhat_cur-{i}.png',
+            #         [prev_frame, context_p['x_hat'], frame]
+            #     )
+            prev_frame = context_p['x_hat']
+
+        # all frames statictics
+        stats['bpp'] = (stats['i-bpp'] + stats['mv-bpp'] + stats['p-bpp']) / len(frames)
+        stats['psnr'] = (stats['i-psnr'] + stats['p-psnr']) / len(frames)
+        # average over p-frames only
+        for key in p_stats_keys:
+            stats[key] = stats[key] / len(p_frames)
+
         return stats
 
-    def compress_mode(self, mode=True):
-        if mode:
-            for block in self.dec_blocks:
-                if hasattr(block, 'update'):
-                    block.update()
-        self.compressing = mode
+    # @torch.no_grad()
+    # def forward_eval(self, frames):
+    #     return self.forward(frames)
 
-    @torch.no_grad()
-    def compress(self, im, log_lmb=None):
-        if log_lmb is None: # use default log-lambda
-            log_lmb = self._default_log_lmb
-        log_lmb = self.expand_to_tensor(log_lmb, n=im.shape[0])
-        lmb_embedding = self._get_lmb_embedding(log_lmb, n=im.shape[0])
-        enc_features = self.encoder(im, lmb_embedding)
-        nB, _, nH, nW = enc_features[min(enc_features.keys())].shape
-        feature = self.get_bias(bhw_repeat=(nB, nH, nW))
-        strings_all = []
-        for i, block in enumerate(self.dec_blocks):
-            if getattr(block, 'is_latent_block', False):
-                f_enc = enc_features[feature.shape[2]]
-                feature, stats = block(feature, lmb_embedding, enc_feature=f_enc, mode='compress',
-                                       log_lmb=log_lmb)
-                strings_all.append(stats['strings'])
-            elif getattr(block, 'requires_embedding', False):
-                feature = block(feature, lmb_embedding)
-            else:
-                feature = block(feature)
-        strings_all.append((nB, nH, nW)) # smallest feature shape
-        strings_all.append(log_lmb) # log lambda
-        return strings_all
-
-    @torch.no_grad()
-    def decompress(self, compressed_object):
-        log_lmb = compressed_object[-1] # log lambda
-        nB, nH, nW = compressed_object[-2] # smallest feature shape
-        log_lmb = self.expand_to_tensor(log_lmb, n=nB)
-        lmb_embedding = self._get_lmb_embedding(log_lmb, n=nB)
-
-        feature = self.get_bias(bhw_repeat=(nB, nH, nW))
-        str_i = 0
-        for bi, block in enumerate(self.dec_blocks):
-            if getattr(block, 'is_latent_block', False):
-                strs_batch = compressed_object[str_i]
-                feature, _ = block(feature, lmb_embedding, mode='decompress',
-                                   log_lmb=log_lmb, strings=strs_batch)
-                str_i += 1
-            elif getattr(block, 'requires_embedding', False):
-                feature = block(feature, lmb_embedding)
-            else:
-                feature = block(feature)
-        assert str_i == len(compressed_object) - 2, f'str_i={str_i}, len={len(compressed_object)}'
-        im_hat = feature
-        return im_hat
-
-    @torch.no_grad()
-    def compress_file(self, img_path, output_path):
-        # read image
-        img = Image.open(img_path)
-        img_padded = pad_divisible_by(img, div=self.max_stride)
-        device = next(self.parameters()).device
-        im = tvf.to_tensor(img_padded).unsqueeze_(0).to(device=device)
-        # compress by model
-        compressed_obj = self.compress(im)
-        compressed_obj.append((img.height, img.width))
-        # save bits to file
-        with open(output_path, 'wb') as f:
-            pickle.dump(compressed_obj, file=f)
-
-    @torch.no_grad()
-    def decompress_file(self, bits_path):
-        # read from file
-        with open(bits_path, 'rb') as f:
-            compressed_obj = pickle.load(file=f)
-        img_h, img_w = compressed_obj.pop()
-        # decompress by model
-        im_hat = self.decompress(compressed_obj)
-        return im_hat[:, :, :img_h, :img_w]
-
-    @torch.no_grad()
-    def self_evaluate(self, im, log_lmb: float):
-        image_stats = defaultdict(float)
-        x_hat, stats_all = self.forward_end2end(im, log_lmb=self.expand_to_tensor(log_lmb,n=1))
-        # compute bpp
-        _, imC, imH, imW = im.shape
-        kl = sum([stat['kl'].sum(dim=(1, 2, 3)) for stat in stats_all]).mean(0) / (imC*imH*imW)
-        bpp_estimated = kl.item() * self.log2_e * imC
-        # compute psnr
-        x_target = im
-        distortion = self.distortion_func(x_hat, x_target).item()
-        mse = tnf.mse_loss(im, x_hat, reduction='mean').item()
-        psnr = float(-10 * math.log10(mse))
-        image_stats['loss'] = float(kl.item() + math.exp(log_lmb) * distortion)
-        image_stats['bpp']  = bpp_estimated
-        image_stats['psnr'] = psnr
-
-        return image_stats
+    # @torch.no_grad()
+    # def self_evaluate(self, dataset, max_frames, log_dir=None):
+    #     results = video_fast_evaluate(self, dataset, max_frames)
+    #     return results
 
 
-def qres_vr(lmb_range=[128,1024]):
-    cfg = dict()
-
-    # variable rate
-    cfg['log_lmb_range'] = (math.log(lmb_range[0]), math.log(lmb_range[1]))
-    cfg['lmb_embed_dim'] = (256, 256)
-    cfg['sin_period'] = 64
-    _emb_dim = cfg['lmb_embed_dim'][1]
-
-    ch = 128
-    dec_nums = [1, 2, 3, 3]
-    enc_dims = [192, ch*3, ch*4, ch*4, ch*4]
-    dec_dims = [ch*4, ch*4, ch*3, ch*2, ch*1]
-    z_dims = [32, 32, 64, 8]
-
-    im_channels = 3
-    cfg['enc_blocks'] = [
-        patch_downsample(im_channels, enc_dims[0], rate=4),
-        *[MyConvNeXtBlockAdaLN(enc_dims[0], _emb_dim, kernel_size=7) for _ in range(6)], # 16x16
-        MyConvNeXtAdaLNPatchDown(enc_dims[0], enc_dims[1], embed_dim=_emb_dim),
-        *[MyConvNeXtBlockAdaLN(enc_dims[1], _emb_dim, kernel_size=7) for _ in range(6)], # 8x8
-        MyConvNeXtAdaLNPatchDown(enc_dims[1], enc_dims[2], embed_dim=_emb_dim),
-        *[MyConvNeXtBlockAdaLN(enc_dims[2], _emb_dim, kernel_size=5) for _ in range(6)], # 4x4
-        MyConvNeXtAdaLNPatchDown(enc_dims[2], enc_dims[3], embed_dim=_emb_dim),
-        *[MyConvNeXtBlockAdaLN(enc_dims[3], _emb_dim, kernel_size=3) for _ in range(4)], # 2x2
-        MyConvNeXtAdaLNPatchDown(enc_dims[3], enc_dims[3], embed_dim=_emb_dim),
-        *[MyConvNeXtBlockAdaLN(enc_dims[3], _emb_dim, kernel_size=1) for _ in range(4)], # 1x1
-    ]
-    cfg['dec_blocks'] = [
-        # 1x1
-        *[VRLatentBlock3Pos(dec_dims[0], z_dims[0], _emb_dim, enc_width=enc_dims[-1], kernel_size=1, mlp_ratio=4) for _ in range(dec_nums[0])],
-        MyConvNeXtBlockAdaLN(dec_dims[0], _emb_dim, kernel_size=1, mlp_ratio=4),
-        patch_upsample(dec_dims[0], dec_dims[1], rate=2),
-        # 2x2
-        MyConvNeXtBlockAdaLN(dec_dims[1], _emb_dim, kernel_size=3, mlp_ratio=3),
-        *[VRLatentBlock3Pos(dec_dims[1], z_dims[1], _emb_dim, enc_width=enc_dims[-2], kernel_size=3, mlp_ratio=3) for _ in range(dec_nums[1])],
-        MyConvNeXtBlockAdaLN(dec_dims[1], _emb_dim, kernel_size=3, mlp_ratio=3),
-        patch_upsample(dec_dims[1], dec_dims[2], rate=2),
-        # 4x4
-        MyConvNeXtBlockAdaLN(dec_dims[2], _emb_dim, kernel_size=5, mlp_ratio=2),
-        *[VRLatentBlock3Pos(dec_dims[2], z_dims[2], _emb_dim, enc_width=enc_dims[-3], kernel_size=5, mlp_ratio=2) for _ in range(dec_nums[2])],
-        MyConvNeXtBlockAdaLN(dec_dims[2], _emb_dim, kernel_size=5, mlp_ratio=2),
-        patch_upsample(dec_dims[2], dec_dims[3], rate=2),
-        # 8x8
-        MyConvNeXtBlockAdaLN(dec_dims[3], _emb_dim, kernel_size=7, mlp_ratio=1.75),
-        *[VRLatentBlock3Pos(dec_dims[3], z_dims[3], _emb_dim, enc_width=enc_dims[-4], kernel_size=7, mlp_ratio=1.75) for _ in range(dec_nums[3])],
-        MyConvNeXtBlockAdaLN(dec_dims[3], _emb_dim, kernel_size=7, mlp_ratio=1.75),
-        patch_upsample(dec_dims[3], dec_dims[4], rate=2),
-        # 16x16
-        *[MyConvNeXtBlockAdaLN(dec_dims[4], _emb_dim, kernel_size=7, mlp_ratio=1.5) for _ in range(8)],
-        patch_upsample(dec_dims[4], im_channels, rate=4)
-    ]
-
-    cfg['max_stride'] = 64
-
-    # cfg['log_images'] = ['collie64.png', 'gun128.png', 'motor256.png']
-
-    model = VariableRateLossyVAE(cfg)
-    # if pretrained:
-    #     url = 'https://huggingface.co/duanzh0/my-model-weights/resolve/main/vr_version2.pt'
-    #     msd = load_state_dict_from_url(url)['model']
-    #     model.load_state_dict(msd)
+def dhvc_vr(lmb_range=[64, 512]):
+    model = LossyVideoCodec()
     return model

@@ -11,7 +11,7 @@ from .base_model import CompressionModel, get_scale_table
 from .utils import quantize_ste, update_registered_buffers, Demultiplexer, Multiplexer
 from ..layers import ME_Spynet, ResBlock, UNet, conv1x1, subpel_conv3x3, \
         get_enc_dec_models, get_hyper_enc_dec_models, flow_warp, bilineardownsacling, \
-        CheckerboardMaskedConv2d 
+        CheckerboardMaskedConv2d
 
 
 class FeatureExtractor(nn.Module):
