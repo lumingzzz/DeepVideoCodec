@@ -1,2 +1,3 @@
-from .image_model import qres_vr
-from .video_model import dhvc_vr
+from .dmc_model import DMC
+# from .video_model_v2 import DMC_v2
+
