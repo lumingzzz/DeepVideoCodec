@@ -162,10 +162,11 @@ class MotionContextModel(CompressionModel):
         means_hat = means * mask
         scales_hat = scales * mask
 
-        y_hat = quantize_ste((y - means_hat) * mask) + means_hat
-        return y_hat, means_hat, scales_hat
+        y_quant = quantize_ste((y - means_hat) * mask)
+        y_hat = y_quant + means_hat
+        return y_quant, y_hat, means_hat, scales_hat
 
-    def forward_dual_prior(self, y, means, scales):
+    def forward_dual_prior(self, y, means, scales, mode='trainval'):
         '''
         y_0 means split in channel, the first half
         y_1 means split in channel, the second half
@@ -180,17 +181,17 @@ class MotionContextModel(CompressionModel):
         means_0, means_1 = means.chunk(2, 1)
         scales_0, scales_1 = scales.chunk(2, 1)
 
-        y_hat_0_0, means_hat_0_0, scales_hat_0_0 = \
+        y_quant_0_0, y_hat_0_0, means_hat_0_0, scales_hat_0_0 = \
             self.process_with_mask(y_0, means_0, scales_0, mask_0)
-        y_hat_1_1, means_hat_1_1, scales_hat_1_1 = \
+        y_quant_1_1, y_hat_1_1, means_hat_1_1, scales_hat_1_1 = \
             self.process_with_mask(y_1, means_1, scales_1, mask_1)
 
         params = torch.cat((y_hat_0_0, y_hat_1_1, means, scales), dim=1)
         means_0, scales_0, means_1, scales_1 = self.y_spatial_prior(params).chunk(4, 1)
 
-        y_hat_0_1, means_hat_0_1, scales_hat_0_1 = \
+        y_quant_0_1, y_hat_0_1, means_hat_0_1, scales_hat_0_1 = \
             self.process_with_mask(y_0, means_0, scales_0, mask_1)
-        y_hat_1_0, means_hat_1_0, scales_hat_1_0 = \
+        y_quant_1_0, y_hat_1_0, means_hat_1_0, scales_hat_1_0 = \
             self.process_with_mask(y_1, means_1, scales_1, mask_0)
 
         y_hat_0 = y_hat_0_0 + y_hat_0_1
@@ -204,6 +205,16 @@ class MotionContextModel(CompressionModel):
         y_hat = torch.cat((y_hat_0, y_hat_1), dim=1)
         means_hat = torch.cat((means_hat_0, means_hat_1), dim=1)
         scales_hat = torch.cat((scales_hat_0, scales_hat_1), dim=1)
+
+        if mode == 'compress':
+            y_quant_w_0 = y_quant_0_0 + y_quant_1_1
+            y_quant_w_1 = y_quant_0_1 + y_quant_1_0
+            means_w_0 = means_hat_0_0 + means_hat_1_1  
+            means_w_1 = means_hat_0_1 + means_hat_1_0
+            scales_w_0 = scales_hat_0_0 + scales_hat_1_1
+            scales_w_1 = scales_hat_0_1 + scales_hat_1_0
+            return y_hat, y_quant_w_0, y_quant_w_1, means_w_0, means_w_1, scales_w_0, scales_w_1
+
         return y_hat, means_hat, scales_hat
 
     def forward(self, y, y_ref):
@@ -233,82 +244,54 @@ class MotionContextModel(CompressionModel):
         if y_ref is None:
             y_ref = torch.zeros_like(y)
         means_hat, scales_hat = self.y_prior_fusion(torch.cat((params, y_ref), dim=1)).chunk(2, 1)
-        y_hat, means_hat, scales_hat = self.forward_dual_prior(y, means_hat, scales_hat)
-        
-        params = self.y_mv_prior_fusion(torch.cat((params, y_ref), dim=1))
-        
-        ctx_params = torch.zeros_like(params)
-        gaussian_params = self.entropy_parameters(
-            torch.cat((params, ctx_params), dim=1)
-        )
-        _, means_hat = gaussian_params.chunk(2, 1)
-        y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat)
-        
-        # set non_anchor to 0
-        y_half = y_hat.clone()
-        y_half[:, :, 0::2, 0::2] = 0
-        y_half[:, :, 1::2, 1::2] = 0
+        y_hat, y_quant_w_0, y_quant_w_1, means_w_0, means_w_1, scales_w_0, scales_w_1 = \
+            self.forward_dual_prior(y, means_hat, scales_hat, mode='compress')
 
-        # set anchor's ctx to 0, otherwise there will be a bias
-        ctx_params = self.context_prediction(y_half)
-        ctx_params[:, :, 0::2, 1::2] = 0
-        ctx_params[:, :, 1::2, 0::2] = 0
+        indexes_0 = self.gaussian_conditional.build_indexes(scales_w_0)
+        indexes_1 = self.gaussian_conditional.build_indexes(scales_w_1)
+        y_strings_0 = self.gaussian_conditional.compress(y_quant_w_0, indexes_0, means=means_w_0)
+        y_strings_1 = self.gaussian_conditional.compress(y_quant_w_1, indexes_1, means=means_w_1)
 
-        gaussian_params = self.entropy_parameters(
-            torch.cat((params, ctx_params), dim=1)
-        )
-        scales_hat, means_hat = gaussian_params.chunk(2, 1)
-        y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat)
-        
-        y_anchor, y_non_anchor = Demultiplexer(y)
-        scales_hat_anchor, scales_hat_non_anchor = Demultiplexer(scales_hat)
-        means_hat_anchor, means_hat_non_anchor = Demultiplexer(means_hat)
-
-        indexes_anchor = self.gaussian_conditional.build_indexes(scales_hat_anchor)
-        indexes_non_anchor = self.gaussian_conditional.build_indexes(scales_hat_non_anchor)
-
-        anchor_strings = self.gaussian_conditional.compress(y_anchor, indexes_anchor, means=means_hat_anchor)
-        non_anchor_strings = self.gaussian_conditional.compress(y_non_anchor, indexes_non_anchor, means=means_hat_non_anchor)
-
-        return y_hat, {"strings": [anchor_strings, non_anchor_strings, z_strings], "shape": z.size()[-2:]}
+        return y_hat, {"strings": [y_strings_0, y_strings_1, z_strings], "shape": z.size()[-2:]}
 
     def decompress(self, strings, shape, y_ref):
         assert isinstance(strings, list) and len(strings) == 3
         z_hat = self.entropy_bottleneck.decompress(strings[2], shape)
         N, _, H, W = z_hat.shape
         params = self.hyper_decoder(z_hat)
-        
         if y_ref is None:
             y_ref = torch.zeros([N, params.size(1)//2, H * 4, W * 4]).to(z_hat.device)
-        params = self.y_mv_prior_fusion(torch.cat((params, y_ref), dim=1))
-        
-        ctx_params = torch.zeros_like(params)
-        gaussian_params = self.entropy_parameters(
-            torch.cat((params, ctx_params), dim=1)
-        )
-        scales_hat, means_hat = gaussian_params.chunk(2, 1)
-        scales_hat_anchor, _ = Demultiplexer(scales_hat)
-        means_hat_anchor, _ = Demultiplexer(means_hat)
-        
-        indexes_anchor = self.gaussian_conditional.build_indexes(scales_hat_anchor)
-        y_anchor = self.gaussian_conditional.decompress(strings[0], indexes_anchor, means=means_hat_anchor)     # [1, 384, 8, 8]
-        y_anchor = Multiplexer(y_anchor, torch.zeros_like(y_anchor))    # [1, 192, 16, 16]
-        
-        ctx_params = self.context_prediction(y_anchor)
-        gaussian_params = self.entropy_parameters(
-            torch.cat((params, ctx_params), dim=1)
-        )
+        means_hat, scales_hat = self.y_prior_fusion(torch.cat((params, y_ref), dim=1)).chunk(2, 1)
 
-        scales_hat, means_hat = gaussian_params.chunk(2, 1)
-        _, scales_hat_non_anchor = Demultiplexer(scales_hat)
-        _, means_hat_non_anchor = Demultiplexer(means_hat)
+        device = means_hat.device
+        _, _, H, W = means_hat.size()
+        mask_0, mask_1 = self.get_mask(H, W, device)
+
+        means_0, means_1 = means_hat.chunk(2, 1)
+        scales_0, scales_1 = scales_hat.chunk(2, 1)
         
-        indexes_non_anchor = self.gaussian_conditional.build_indexes(scales_hat_non_anchor)
-        y_non_anchor = self.gaussian_conditional.decompress(strings[1], indexes_non_anchor, means=means_hat_non_anchor)  # [1, 384, 8, 8]
-        y_non_anchor = Multiplexer(torch.zeros_like(y_non_anchor), y_non_anchor)    # [1, 192, 16, 16]
-        
-        # gather
-        y_hat = y_anchor + y_non_anchor
+        means_r_0 = means_0 * mask_0 + means_1 * mask_1
+        scales_r_0 = scales_0 * mask_0 + scales_1 * mask_1
+
+        indexes_0 = self.gaussian_conditional.build_indexes(scales_r_0)
+        y_quant_r_0 = self.gaussian_conditional.decompress(strings[0], indexes_0, means=means_r_0)  
+
+        y_hat_0_0 = (y_quant_r_0 + means_0) * mask_0
+        y_hat_1_1 = (y_quant_r_0 + means_1) * mask_1
+
+        params = torch.cat((y_hat_0_0, y_hat_1_1, means_hat, scales_hat), dim=1)
+        means_0, scales_0, means_1, scales_1 = self.y_spatial_prior(params).chunk(4, 1)
+
+        means_r_1 = means_0 * mask_1 + means_1 * mask_0
+        scales_r_1 = scales_0 * mask_1 + scales_1 * mask_0
+        indexes_1 = self.gaussian_conditional.build_indexes(scales_r_1)
+        y_quant_r_1 = self.gaussian_conditional.decompress(strings[1], indexes_1, means=means_r_1)  
+        y_hat_0_1 = (y_quant_r_1 + means_0) * mask_1
+        y_hat_1_0 = (y_quant_r_1 + means_1) * mask_0
+
+        y_hat_0 = y_hat_0_0 + y_hat_0_1
+        y_hat_1 = y_hat_1_1 + y_hat_1_0
+        y_hat = torch.cat((y_hat_0, y_hat_1), dim=1)
 
         return y_hat
 
@@ -356,10 +339,11 @@ class FrameContextModel(CompressionModel):
         means_hat = means * mask
         scales_hat = scales * mask
 
-        y_hat = quantize_ste((y - means_hat) * mask) + means_hat
-        return y_hat, means_hat, scales_hat
+        y_quant = quantize_ste((y - means_hat) * mask)
+        y_hat = y_quant + means_hat
+        return y_quant, y_hat, means_hat, scales_hat
 
-    def forward_dual_prior(self, y, means, scales):
+    def forward_dual_prior(self, y, means, scales, mode='trainval'):
         '''
         y_0 means split in channel, the first half
         y_1 means split in channel, the second half
@@ -374,17 +358,17 @@ class FrameContextModel(CompressionModel):
         means_0, means_1 = means.chunk(2, 1)
         scales_0, scales_1 = scales.chunk(2, 1)
 
-        y_hat_0_0, means_hat_0_0, scales_hat_0_0 = \
+        y_quant_0_0, y_hat_0_0, means_hat_0_0, scales_hat_0_0 = \
             self.process_with_mask(y_0, means_0, scales_0, mask_0)
-        y_hat_1_1, means_hat_1_1, scales_hat_1_1 = \
+        y_quant_1_1, y_hat_1_1, means_hat_1_1, scales_hat_1_1 = \
             self.process_with_mask(y_1, means_1, scales_1, mask_1)
 
         params = torch.cat((y_hat_0_0, y_hat_1_1, means, scales), dim=1)
         means_0, scales_0, means_1, scales_1 = self.y_spatial_prior(params).chunk(4, 1)
 
-        y_hat_0_1, means_hat_0_1, scales_hat_0_1 = \
+        y_quant_0_1, y_hat_0_1, means_hat_0_1, scales_hat_0_1 = \
             self.process_with_mask(y_0, means_0, scales_0, mask_1)
-        y_hat_1_0, means_hat_1_0, scales_hat_1_0 = \
+        y_quant_1_0, y_hat_1_0, means_hat_1_0, scales_hat_1_0 = \
             self.process_with_mask(y_1, means_1, scales_1, mask_0)
 
         y_hat_0 = y_hat_0_0 + y_hat_0_1
@@ -398,6 +382,16 @@ class FrameContextModel(CompressionModel):
         y_hat = torch.cat((y_hat_0, y_hat_1), dim=1)
         means_hat = torch.cat((means_hat_0, means_hat_1), dim=1)
         scales_hat = torch.cat((scales_hat_0, scales_hat_1), dim=1)
+
+        if mode == 'compress':
+            y_quant_w_0 = y_quant_0_0 + y_quant_1_1
+            y_quant_w_1 = y_quant_0_1 + y_quant_1_0
+            means_w_0 = means_hat_0_0 + means_hat_1_1  
+            means_w_1 = means_hat_0_1 + means_hat_1_0
+            scales_w_0 = scales_hat_0_0 + scales_hat_1_1
+            scales_w_1 = scales_hat_0_1 + scales_hat_1_0
+            return y_hat, y_quant_w_0, y_quant_w_1, means_w_0, means_w_1, scales_w_0, scales_w_1
+
         return y_hat, means_hat, scales_hat
 
     def forward(self, y, y_ref, context):
@@ -418,94 +412,68 @@ class FrameContextModel(CompressionModel):
         _, y_likelihoods = self.gaussian_conditional(y, scales_hat, means_hat)
         return y_hat, {"y": y_likelihoods, "z": z_likelihoods}
 
-    # def compress(self, y, y_ref, context):
-    #     z = self.hyper_encoder(y)
+    def compress(self, y, y_ref, context):
+        z = self.hyper_encoder(y)
 
-    #     z_strings = self.entropy_bottleneck.compress(z)
-    #     z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
+        z_strings = self.entropy_bottleneck.compress(z)
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
         
-    #     params = self.hyper_decoder(z_hat)
-        
-    #     if y_ref is None:
-    #         y_ref = torch.zeros_like(y)
-    #     temporal_params = self.temporal_prior_encoder(context)
-    #     params = self.y_prior_fusion(torch.cat((temporal_params, params, y_ref), dim=1))
-        
-    #     ctx_params = torch.zeros_like(params)
-    #     gaussian_params = self.entropy_parameters(
-    #         torch.cat((params, ctx_params), dim=1)
-    #     )
-    #     _, means_hat = gaussian_params.chunk(2, 1)
-    #     y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat)
-        
-    #     # set non_anchor to 0
-    #     y_half = y_hat.clone()
-    #     y_half[:, :, 0::2, 0::2] = 0
-    #     y_half[:, :, 1::2, 1::2] = 0
+        params = self.hyper_decoder(z_hat)
+        if y_ref is None:
+            y_ref = torch.zeros_like(y)
+        temporal_params = self.temporal_prior_encoder(context)
+        means_hat, scales_hat = self.y_prior_fusion(torch.cat((temporal_params, params, y_ref), dim=1)).chunk(2, 1)
+        y_hat, y_quant_w_0, y_quant_w_1, means_w_0, means_w_1, scales_w_0, scales_w_1 = \
+            self.forward_dual_prior(y, means_hat, scales_hat, mode='compress')
 
-    #     # set anchor's ctx to 0, otherwise there will be a bias
-    #     ctx_params = self.context_prediction(y_half)
-    #     ctx_params[:, :, 0::2, 1::2] = 0
-    #     ctx_params[:, :, 1::2, 0::2] = 0
+        indexes_0 = self.gaussian_conditional.build_indexes(scales_w_0)
+        indexes_1 = self.gaussian_conditional.build_indexes(scales_w_1)
+        y_strings_0 = self.gaussian_conditional.compress(y_quant_w_0, indexes_0, means=means_w_0)
+        y_strings_1 = self.gaussian_conditional.compress(y_quant_w_1, indexes_1, means=means_w_1)
 
-    #     gaussian_params = self.entropy_parameters(
-    #         torch.cat((params, ctx_params), dim=1)
-    #     )
-    #     scales_hat, means_hat = gaussian_params.chunk(2, 1)
-    #     y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat)
-        
-    #     y_anchor, y_non_anchor = Demultiplexer(y)
-    #     scales_hat_anchor, scales_hat_non_anchor = Demultiplexer(scales_hat)
-    #     means_hat_anchor, means_hat_non_anchor = Demultiplexer(means_hat)
+        return y_hat, {"strings": [y_strings_0, y_strings_1, z_strings], "shape": z.size()[-2:]}
 
-    #     indexes_anchor = self.gaussian_conditional.build_indexes(scales_hat_anchor)
-    #     indexes_non_anchor = self.gaussian_conditional.build_indexes(scales_hat_non_anchor)
+    def decompress(self, strings, shape, y_ref, context):
+        assert isinstance(strings, list) and len(strings) == 3
+        z_hat = self.entropy_bottleneck.decompress(strings[2], shape)
+        N, _, H, W = z_hat.shape
+        params = self.hyper_decoder(z_hat)
+        if y_ref is None:
+            y_ref = torch.zeros([N, params.size(1)//2, H * 4, W * 4]).to(z_hat.device)
+        temporal_params = self.temporal_prior_encoder(context)
+        means_hat, scales_hat = self.y_prior_fusion(torch.cat((temporal_params, params, y_ref), dim=1)).chunk(2, 1)
 
-    #     anchor_strings = self.gaussian_conditional.compress(y_anchor, indexes_anchor, means=means_hat_anchor)
-    #     non_anchor_strings = self.gaussian_conditional.compress(y_non_anchor, indexes_non_anchor, means=means_hat_non_anchor)
+        device = means_hat.device
+        _, _, H, W = means_hat.size()
+        mask_0, mask_1 = self.get_mask(H, W, device)
 
-    #     return y_hat, {"strings": [anchor_strings, non_anchor_strings, z_strings], "shape": z.size()[-2:]}
+        means_0, means_1 = means_hat.chunk(2, 1)
+        scales_0, scales_1 = scales_hat.chunk(2, 1)
+        
+        means_r_0 = means_0 * mask_0 + means_1 * mask_1
+        scales_r_0 = scales_0 * mask_0 + scales_1 * mask_1
 
-    # def decompress(self, strings, shape, y_ref, context):
-    #     assert isinstance(strings, list) and len(strings) == 3
-    #     z_hat = self.entropy_bottleneck.decompress(strings[2], shape)
-    #     N, _, H, W = z_hat.shape
-    #     params = self.hyper_decoder(z_hat)
-        
-    #     if y_ref is None:
-    #         y_ref = torch.zeros([N, params.size(1)//2, H * 4, W * 4]).to(z_hat.device)
-    #     temporal_params = self.temporal_prior_encoder(context)
-    #     params = self.y_prior_fusion(torch.cat((temporal_params, params, y_ref), dim=1))
-        
-    #     ctx_params = torch.zeros_like(params)
-    #     gaussian_params = self.entropy_parameters(
-    #         torch.cat((params, ctx_params), dim=1)
-    #     )
-    #     scales_hat, means_hat = gaussian_params.chunk(2, 1)
-    #     scales_hat_anchor, _ = Demultiplexer(scales_hat)
-    #     means_hat_anchor, _ = Demultiplexer(means_hat)
-        
-    #     indexes_anchor = self.gaussian_conditional.build_indexes(scales_hat_anchor)
-    #     y_anchor = self.gaussian_conditional.decompress(strings[0], indexes_anchor, means=means_hat_anchor)     # [1, 384, 8, 8]
-    #     y_anchor = Multiplexer(y_anchor, torch.zeros_like(y_anchor))    # [1, 192, 16, 16]
-        
-    #     ctx_params = self.context_prediction(y_anchor)
-    #     gaussian_params = self.entropy_parameters(
-    #         torch.cat((params, ctx_params), dim=1)
-    #     )
+        indexes_0 = self.gaussian_conditional.build_indexes(scales_r_0)
+        y_quant_r_0 = self.gaussian_conditional.decompress(strings[0], indexes_0, means=means_r_0)  
 
-    #     scales_hat, means_hat = gaussian_params.chunk(2, 1)
-    #     _, scales_hat_non_anchor = Demultiplexer(scales_hat)
-    #     _, means_hat_non_anchor = Demultiplexer(means_hat)
-        
-    #     indexes_non_anchor = self.gaussian_conditional.build_indexes(scales_hat_non_anchor)
-    #     y_non_anchor = self.gaussian_conditional.decompress(strings[1], indexes_non_anchor, means=means_hat_non_anchor)  # [1, 384, 8, 8]
-    #     y_non_anchor = Multiplexer(torch.zeros_like(y_non_anchor), y_non_anchor)    # [1, 192, 16, 16]
-        
-    #     # gather
-    #     y_hat = y_anchor + y_non_anchor
+        y_hat_0_0 = (y_quant_r_0 + means_0) * mask_0
+        y_hat_1_1 = (y_quant_r_0 + means_1) * mask_1
 
-    #     return y_hat
+        params = torch.cat((y_hat_0_0, y_hat_1_1, means_hat, scales_hat), dim=1)
+        means_0, scales_0, means_1, scales_1 = self.y_spatial_prior(params).chunk(4, 1)
+
+        means_r_1 = means_0 * mask_1 + means_1 * mask_0
+        scales_r_1 = scales_0 * mask_1 + scales_1 * mask_0
+        indexes_1 = self.gaussian_conditional.build_indexes(scales_r_1)
+        y_quant_r_1 = self.gaussian_conditional.decompress(strings[1], indexes_1, means=means_r_1)  
+        y_hat_0_1 = (y_quant_r_1 + means_0) * mask_1
+        y_hat_1_0 = (y_quant_r_1 + means_1) * mask_0
+
+        y_hat_0 = y_hat_0_0 + y_hat_0_1
+        y_hat_1 = y_hat_1_1 + y_hat_1_0
+        y_hat = torch.cat((y_hat_0, y_hat_1), dim=1)
+
+        return y_hat
 
 
 class DMC(nn.Module):

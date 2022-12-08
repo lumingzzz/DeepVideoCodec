@@ -10,14 +10,14 @@ import numpy as np
 from pathlib import Path
 from collections import OrderedDict
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from compressai.zoo import cheng2020_anchor
 
-from models import DCVC
+from models import DMC
 
 torch.backends.cudnn.deterministic = True
 torch.set_num_threads(1)
@@ -105,8 +105,8 @@ def evaluate_one_video(args, quality, frame_dir):
     net_intra.update(force=True)
     net_intra.to(device).eval()
 
-    net_inter = DCVC()
-    snapshot = torch.load('/workspace/lm/videoCodec/dcvc/checkpoints/dcvc/2048.0/checkpoint_best_loss.pth.tar')
+    net_inter = DMC()
+    snapshot = torch.load('/workspace/lm/videoCodec/dmc/checkpoints/dmc/2048.0/checkpoint_best_loss.pth.tar')
 
     # new_state_dict = OrderedDict()
     # for k, v in snapshot["state_dict"].items():
@@ -178,6 +178,7 @@ def evaluate_one_video(args, quality, frame_dir):
 
         mse = torch.mean((x - rec)**2).item()
         psnr = -10 * np.log10(mse)
+        print(psnr)
 
         sum_psnr += psnr
     
