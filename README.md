@@ -1,1 +1,1 @@
-# Learned Video Codec
+# Re-implementation of recent best-performing learned video compression methods.
