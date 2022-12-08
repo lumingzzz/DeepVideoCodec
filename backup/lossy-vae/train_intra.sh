@@ -1,1 +1,0 @@
-python train_intra.py -d /workspace/lm/data/flicker/ --epochs 400 -lr 1e-4 --batch-size 8 --gpu-id 2 --cuda --save # --checkpoint /workspace/lm/TinyLIC-Re/examples/checkpoints/tinylic/1/checkpoint_best_loss.pth.tar

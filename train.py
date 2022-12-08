@@ -40,7 +40,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import List
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 import torch
 import torch.nn as nn
@@ -227,6 +227,16 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
+class CustomDataParallel(nn.DataParallel):
+    """Custom DataParallel to access the module methods."""
+
+    def __getattr__(self, key):
+        try:
+            return super().__getattr__(key)
+        except AttributeError:
+            return getattr(self.module, key)
+
+
 def compute_aux_loss(aux_list: List, backward=False):
     aux_loss_sum = 0
     for aux_loss in aux_list:
@@ -285,41 +295,46 @@ def train_one_epoch(
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
-        if epoch < 20:
-            out_net = net_inter(d, motion_pre=True, frame_pre=False)
+        if epoch < 10:
+            out_net = net_inter(d, motion_pretrain=True, frame_pretrain=False)
+            out_criterion = criterion(out_net, d[1:])
+            out_criterion["mse_loss"].backward() 
+
+        if epoch >= 10 and epoch < 20:
+            out_net = net_inter(d, motion_pretrain=True, frame_pretrain=False)
+            out_criterion = criterion(out_net, d[1:])
+            out_criterion["loss"].backward()
+
+        if epoch >= 20 and epoch < 30:
+            out_net = net_inter(d, motion_pretrain=False, frame_pretrain=True)
             out_criterion = criterion(out_net, d[1:])
             out_criterion["mse_loss"].backward()
-        if epoch >= 20 and epoch < 40:
-            out_net = net_inter(d, motion_pre=True, frame_pre=False)
+
+        if epoch >= 30 and epoch < 40:
+            out_net = net_inter(d, motion_pretrain=False, frame_pretrain=True)
             out_criterion = criterion(out_net, d[1:])
             out_criterion["loss"].backward()
-        if epoch >= 40 and epoch < 60:
-            out_net = net_inter(d, motion_pre=False, frame_pre=True)
-            out_criterion = criterion(out_net, d[1:])
-            out_criterion["mse_loss"].backward()
-        if epoch >= 60 and epoch < 80:
-            out_net = net_inter(d, motion_pre=False, frame_pre=True)
+
+        if epoch >= 40 and epoch < 50:
+            out_net = net_inter(d, motion_pretrain=False, frame_pretrain=False)
             out_criterion = criterion(out_net, d[1:])
             out_criterion["loss"].backward()
-        if epoch >= 80 and epoch < 100:
-            out_net = net_inter(d, motion_pre=False, frame_pre=False)
-            out_criterion = criterion(out_net, d[1:])
-            out_criterion["loss"].backward()
-        if epoch >= 100:
+
+        if epoch >= 50:
             with torch.no_grad():
                 frame_i_out = net_intra(d[0])
                 d[0] = frame_i_out["x_hat"]
 
-            out_net = net_inter(d, motion_pre=False, frame_pre=False)
+            out_net = net_inter(d, motion_pretrain=False, frame_pretrain=False)
             out_criterion = criterion(out_net, d[1:])
             out_criterion["loss"].backward()
 
         if clip_max_norm > 0:
-            torch.nn.utils.clip_grad_norm_(net_inter.parameters(), clip_max_norm)
+                torch.nn.utils.clip_grad_norm_(net_inter.parameters(), clip_max_norm)
         optimizer.step()
 
         aux_loss = compute_aux_loss(net_inter.aux_loss(), backward=True)
-        aux_optimizer.step()
+        aux_optimizer.step()   
         
         if i * batch_size % 5000 == 0:
             logging.info(
@@ -343,12 +358,28 @@ def test_epoch(epoch, test_dataloader, net_intra, net_inter, criterion):
     with torch.no_grad():
         for batch in test_dataloader:
             d = [frames.to(device) for frames in batch]
-        
-            frame_i_out = net_intra(d[0])
-            d[0] = frame_i_out["x_hat"]
-            
-            out_net = net_inter(d)
-            out_criterion = criterion(out_net, d[1:])
+
+            if epoch < 10:
+                out_net = net_inter(d, motion_pretrain=True, frame_pretrain=False)
+                out_criterion = criterion(out_net, d[1:])
+            if epoch >= 10 and epoch < 20:
+                out_net = net_inter(d, motion_pretrain=True, frame_pretrain=False)
+                out_criterion = criterion(out_net, d[1:])
+            if epoch >= 20 and epoch < 30:
+                out_net = net_inter(d, motion_pretrain=False, frame_pretrain=True)
+                out_criterion = criterion(out_net, d[1:])
+            if epoch >= 30 and epoch < 40:
+                out_net = net_inter(d, motion_pretrain=False, frame_pretrain=True)
+                out_criterion = criterion(out_net, d[1:])
+            if epoch >= 40 and epoch < 50:
+                out_net = net_inter(d, motion_pretrain=False, frame_pretrain=False)
+                out_criterion = criterion(out_net, d[1:])
+            if epoch >= 50:
+                frame_i_out = net_intra(d[0])
+                d[0] = frame_i_out["x_hat"]
+
+                out_net = net_inter(d, motion_pretrain=False, frame_pretrain=False)
+                out_criterion = criterion(out_net, d[1:])
 
             aux_loss.update(compute_aux_loss(net_inter.aux_loss()))
             loss.update(out_criterion["loss"])
@@ -531,21 +562,27 @@ def main(argv):
     )
 
     net_intra = cheng2020_anchor(quality=args.quality_level, pretrained=True)
+    net_intra = net_intra.to(device)
+
+    for param in net_intra.parameters():
+        param.requires_grad = False
+    net_intra.eval()
+
     # net_intra = TinyLIC()
     # snapshot = torch.load('/workspace/lm/TinyLIC-Re/example/checkpoint_q'+str(args.quality_level)+'.pth.tar',
     #                     map_location=device)
     # net_intra.load_state_dict(snapshot, strict=True)
 
-    for param in net_intra.parameters():
-        param.requires_grad = False
-    net_intra = net_intra.to(device)
-    net_intra.eval()
-
     net_inter = DMC()
     net_inter = net_inter.to(device)
 
+    # if args.cuda and torch.cuda.device_count() > 1:
+    #     net_intra = CustomDataParallel(net_intra)
+    #     net_inter = CustomDataParallel(net_inter)
+
     optimizer, aux_optimizer = configure_optimizers(net_inter, args)
-    lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
+    # lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
+    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[300,], gamma=0.1)
     criterion = RateDistortionLoss(lmbda=args.lmbda, return_details=True)
 
     last_epoch = 0
@@ -553,10 +590,14 @@ def main(argv):
         print("Loading", args.checkpoint)
         checkpoint = torch.load(args.checkpoint, map_location=device)
         last_epoch = checkpoint["epoch"] + 1
-        net_inter.load_state_dict(checkpoint["state_dict"], strict=False)
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
-        lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+        net_inter.load_state_dict(checkpoint["state_dict"])
+        # optimizer.load_state_dict(checkpoint["optimizer"])
+        # aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
+        # lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+
+    if args.cuda and torch.cuda.device_count() > 1:
+        net_intra = CustomDataParallel(net_intra)
+        net_inter = CustomDataParallel(net_inter)
 
     best_loss = float("inf")
     for epoch in range(last_epoch, args.epochs):
@@ -574,7 +615,7 @@ def main(argv):
             args.clip_max_norm,
         )
         loss = test_epoch(epoch, test_dataloader, net_intra, net_inter, criterion)
-        lr_scheduler.step(loss)
+        lr_scheduler.step()
 
         is_best = loss < best_loss
         best_loss = min(loss, best_loss)

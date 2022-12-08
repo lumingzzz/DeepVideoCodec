@@ -27,12 +27,9 @@
 # OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
 # ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from typing import Any
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
 
 
 def conv1x1(in_ch, out_ch, stride=1):
@@ -172,7 +169,7 @@ class ResidualBlock(nn.Module):
         return out
 
 
-backward_grid = [{} for _ in range(9)]    # 0~7 for GPU, -1 for CPU
+backward_grid = [{} for _ in range(8)]    # 0~7 for GPU, -1 for CPU
 
 
 def torch_warp(feature, flow):
@@ -395,32 +392,3 @@ def get_hyper_enc_dec_models(y_channel, z_channel):
     )
 
     return enc, dec
-
-
-class CheckerboardMaskedConv2d(nn.Conv2d):
-    """
-    if kernel_size == (5, 5)
-    then mask:
-        [[0., 1., 0., 1., 0.],
-         [1., 0., 1., 0., 1.],
-         [0., 1., 0., 1., 0.],
-         [1., 0., 1., 0., 1.],
-         [0., 1., 0., 1., 0.]]
-    0: non-anchor
-    1: anchor
-    """
-    def __init__(self, *args: Any, **kwargs: Any):
-        super().__init__(*args, **kwargs)
-
-        self.register_buffer("mask", torch.zeros_like(self.weight.data))
-
-        self.mask[:, :, 0::2, 1::2] = 1
-        self.mask[:, :, 1::2, 0::2] = 1
-
-    def forward(self, x: Tensor) -> Tensor:
-        # self.mask[:, :, :, :] = 0
-        # self.mask[:, :, 0:1, 1:2] = 1
-        # print(self.mask)
-        # TODO: weight assigment is not supported by torchscript
-        self.weight.data *= self.mask
-        return super().forward(x)
