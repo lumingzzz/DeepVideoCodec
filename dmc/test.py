@@ -1,5 +1,4 @@
 import os
-import cv2
 import time
 import json
 import sys
@@ -10,11 +9,16 @@ import numpy as np
 from pathlib import Path
 from collections import OrderedDict
 
+import cv2
+
 os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from torchvision import transforms
+
 from compressai.zoo import cheng2020_anchor
 
 from models import DMC
@@ -160,16 +164,38 @@ def evaluate_one_video(args, quality, frame_dir):
                 out_enc = net_intra.compress(x_pad)
                 out = net_intra.decompress(out_enc["strings"], out_enc["shape"])
                 rec_pad = out["x_hat"]
+                dpb = {
+                        "x_ref": rec_pad,
+                        "feature_ref": None,
+                        "y_ref": None,
+                        "y_mv_ref": None,
+                }
                 rec = crop(rec_pad, (img_height, img_width))
             
             write_body(f, out_enc["shape"], out_enc["strings"])
 
+            # dpb = {
+            #         "x_ref": x_pad,
+            #         "feature_ref": None,
+            #         "y_ref": None,
+            #         "y_mv_ref": None,
+            # }
+            # rec = crop(x_pad, (img_height, img_width))
+
         else:
             with torch.no_grad():
-                out_enc = net_inter.encode_inter(x_pad, rec_pad)
-                rec_pad = net_inter.decode_inter(out_enc["strings"], out_enc["shape"], rec_pad)
+                out_enc = net_inter.encode_inter(x_pad, dpb)
+                rec_pad, info = net_inter.decode_inter(out_enc["strings"], out_enc["shape"], dpb)
                 rec_pad = rec_pad.clamp(0, 1)
+            dpb = {
+                    "x_ref": rec_pad,
+                    "feature_ref": info["feature_ref"],
+                    "y_ref": info["y_ref"],
+                    "y_mv_ref": info["y_mv_ref"],
+                }
             rec = crop(rec_pad, (img_height, img_width))
+            # rec_ = transforms.ToPILImage()(rec.squeeze().cpu())
+            # rec_.save('/workspace/lm/videoCodec/dmc/test.png', format="PNG")
 
             for shape, out in zip(
                 out_enc["shape"].items(), out_enc["strings"].items()

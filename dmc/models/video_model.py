@@ -209,11 +209,9 @@ class MotionContextModel(CompressionModel):
         if mode == 'compress':
             y_quant_w_0 = y_quant_0_0 + y_quant_1_1
             y_quant_w_1 = y_quant_0_1 + y_quant_1_0
-            means_w_0 = means_hat_0_0 + means_hat_1_1  
-            means_w_1 = means_hat_0_1 + means_hat_1_0
             scales_w_0 = scales_hat_0_0 + scales_hat_1_1
             scales_w_1 = scales_hat_0_1 + scales_hat_1_0
-            return y_hat, y_quant_w_0, y_quant_w_1, means_w_0, means_w_1, scales_w_0, scales_w_1
+            return y_hat, y_quant_w_0, y_quant_w_1, scales_w_0, scales_w_1
 
         return y_hat, means_hat, scales_hat
 
@@ -244,13 +242,13 @@ class MotionContextModel(CompressionModel):
         if y_ref is None:
             y_ref = torch.zeros_like(y)
         means_hat, scales_hat = self.y_prior_fusion(torch.cat((params, y_ref), dim=1)).chunk(2, 1)
-        y_hat, y_quant_w_0, y_quant_w_1, means_w_0, means_w_1, scales_w_0, scales_w_1 = \
+        y_hat, y_quant_w_0, y_quant_w_1, scales_w_0, scales_w_1 = \
             self.forward_dual_prior(y, means_hat, scales_hat, mode='compress')
 
         indexes_0 = self.gaussian_conditional.build_indexes(scales_w_0)
         indexes_1 = self.gaussian_conditional.build_indexes(scales_w_1)
-        y_strings_0 = self.gaussian_conditional.compress(y_quant_w_0, indexes_0, means=means_w_0)
-        y_strings_1 = self.gaussian_conditional.compress(y_quant_w_1, indexes_1, means=means_w_1)
+        y_strings_0 = self.gaussian_conditional.compress(y_quant_w_0, indexes_0)
+        y_strings_1 = self.gaussian_conditional.compress(y_quant_w_1, indexes_1)
 
         return y_hat, {"strings": [y_strings_0, y_strings_1, z_strings], "shape": z.size()[-2:]}
 
@@ -270,11 +268,9 @@ class MotionContextModel(CompressionModel):
         means_0, means_1 = means_hat.chunk(2, 1)
         scales_0, scales_1 = scales_hat.chunk(2, 1)
         
-        means_r_0 = means_0 * mask_0 + means_1 * mask_1
         scales_r_0 = scales_0 * mask_0 + scales_1 * mask_1
-
         indexes_0 = self.gaussian_conditional.build_indexes(scales_r_0)
-        y_quant_r_0 = self.gaussian_conditional.decompress(strings[0], indexes_0, means=means_r_0)  
+        y_quant_r_0 = self.gaussian_conditional.decompress(strings[0], indexes_0)  
 
         y_hat_0_0 = (y_quant_r_0 + means_0) * mask_0
         y_hat_1_1 = (y_quant_r_0 + means_1) * mask_1
@@ -282,10 +278,9 @@ class MotionContextModel(CompressionModel):
         params = torch.cat((y_hat_0_0, y_hat_1_1, means_hat, scales_hat), dim=1)
         means_0, scales_0, means_1, scales_1 = self.y_spatial_prior(params).chunk(4, 1)
 
-        means_r_1 = means_0 * mask_1 + means_1 * mask_0
         scales_r_1 = scales_0 * mask_1 + scales_1 * mask_0
         indexes_1 = self.gaussian_conditional.build_indexes(scales_r_1)
-        y_quant_r_1 = self.gaussian_conditional.decompress(strings[1], indexes_1, means=means_r_1)  
+        y_quant_r_1 = self.gaussian_conditional.decompress(strings[1], indexes_1)  
         y_hat_0_1 = (y_quant_r_1 + means_0) * mask_1
         y_hat_1_0 = (y_quant_r_1 + means_1) * mask_0
 
@@ -386,11 +381,9 @@ class FrameContextModel(CompressionModel):
         if mode == 'compress':
             y_quant_w_0 = y_quant_0_0 + y_quant_1_1
             y_quant_w_1 = y_quant_0_1 + y_quant_1_0
-            means_w_0 = means_hat_0_0 + means_hat_1_1  
-            means_w_1 = means_hat_0_1 + means_hat_1_0
             scales_w_0 = scales_hat_0_0 + scales_hat_1_1
             scales_w_1 = scales_hat_0_1 + scales_hat_1_0
-            return y_hat, y_quant_w_0, y_quant_w_1, means_w_0, means_w_1, scales_w_0, scales_w_1
+            return y_hat, y_quant_w_0, y_quant_w_1, scales_w_0, scales_w_1
 
         return y_hat, means_hat, scales_hat
 
@@ -423,13 +416,13 @@ class FrameContextModel(CompressionModel):
             y_ref = torch.zeros_like(y)
         temporal_params = self.temporal_prior_encoder(context)
         means_hat, scales_hat = self.y_prior_fusion(torch.cat((temporal_params, params, y_ref), dim=1)).chunk(2, 1)
-        y_hat, y_quant_w_0, y_quant_w_1, means_w_0, means_w_1, scales_w_0, scales_w_1 = \
+        y_hat, y_quant_w_0, y_quant_w_1, scales_w_0, scales_w_1 = \
             self.forward_dual_prior(y, means_hat, scales_hat, mode='compress')
 
         indexes_0 = self.gaussian_conditional.build_indexes(scales_w_0)
         indexes_1 = self.gaussian_conditional.build_indexes(scales_w_1)
-        y_strings_0 = self.gaussian_conditional.compress(y_quant_w_0, indexes_0, means=means_w_0)
-        y_strings_1 = self.gaussian_conditional.compress(y_quant_w_1, indexes_1, means=means_w_1)
+        y_strings_0 = self.gaussian_conditional.compress(y_quant_w_0, indexes_0)
+        y_strings_1 = self.gaussian_conditional.compress(y_quant_w_1, indexes_1)
 
         return y_hat, {"strings": [y_strings_0, y_strings_1, z_strings], "shape": z.size()[-2:]}
 
@@ -450,11 +443,9 @@ class FrameContextModel(CompressionModel):
         means_0, means_1 = means_hat.chunk(2, 1)
         scales_0, scales_1 = scales_hat.chunk(2, 1)
         
-        means_r_0 = means_0 * mask_0 + means_1 * mask_1
         scales_r_0 = scales_0 * mask_0 + scales_1 * mask_1
-
         indexes_0 = self.gaussian_conditional.build_indexes(scales_r_0)
-        y_quant_r_0 = self.gaussian_conditional.decompress(strings[0], indexes_0, means=means_r_0)  
+        y_quant_r_0 = self.gaussian_conditional.decompress(strings[0], indexes_0)  
 
         y_hat_0_0 = (y_quant_r_0 + means_0) * mask_0
         y_hat_1_1 = (y_quant_r_0 + means_1) * mask_1
@@ -462,10 +453,9 @@ class FrameContextModel(CompressionModel):
         params = torch.cat((y_hat_0_0, y_hat_1_1, means_hat, scales_hat), dim=1)
         means_0, scales_0, means_1, scales_1 = self.y_spatial_prior(params).chunk(4, 1)
 
-        means_r_1 = means_0 * mask_1 + means_1 * mask_0
         scales_r_1 = scales_0 * mask_1 + scales_1 * mask_0
         indexes_1 = self.gaussian_conditional.build_indexes(scales_r_1)
-        y_quant_r_1 = self.gaussian_conditional.decompress(strings[1], indexes_1, means=means_r_1)  
+        y_quant_r_1 = self.gaussian_conditional.decompress(strings[1], indexes_1)  
         y_hat_0_1 = (y_quant_r_1 + means_0) * mask_1
         y_hat_1_0 = (y_quant_r_1 + means_1) * mask_0
 
@@ -613,12 +603,12 @@ class DMC(nn.Module):
         y_mv_hat = self.motion_context_model.decompress(strings[key], shapes[key], dpb["y_mv_ref"])
 
         mv_hat = self.motion_decoder(y_mv_hat)
-        context1, context2, context3, _ = self.motion_compensation(mv_hat, dpb)
+        context1, context2, context3, x_warp = self.motion_compensation(mv_hat, dpb)
 
         key = "frame"
         y_hat = self.frame_context_model.decompress(strings[key], shapes[key], dpb["y_ref"], context3)
 
-        x_rec_feature = self.contextual_decoder(y_hat, context1, context2, context3)
+        x_rec_feature = self.contextual_decoder(y_hat, context2, context3)
         feature, x_rec = self.recon_generation_net(x_rec_feature, context1)
     
         return x_rec, {"x_ref": x_rec, "feature_ref": feature, "y_ref": y_hat, "y_mv_ref": y_mv_hat}
